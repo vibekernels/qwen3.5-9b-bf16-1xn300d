@@ -104,7 +104,7 @@ __global__ void fast_gemv_kernel(
     float acc = 0.0f;
 
     for (int i = lane_id; i < K8; i += 32) {
-        uint4 wc = W_v[i];
+        uint4 wc = __ldcs(&W_v[i]);  // streaming load: weights are read-once, don't pollute L2
         uint4 xc = x_v[i];
         const __nv_bfloat162* wb2 = reinterpret_cast<const __nv_bfloat162*>(&wc);
         const __nv_bfloat162* xb2 = reinterpret_cast<const __nv_bfloat162*>(&xc);

@@ -9,7 +9,7 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) with **zero external BLAS dep
 | Metric | Our Implementation | llama.cpp | Speedup |
 |--------|-------------------|-----------|---------|
 | Prompt eval (112 tok) | **1790 tok/s** | 563 tok/s | **3.18×** |
-| Generation | **90.7 tok/s** | 77.8 tok/s | **1.17×** |
+| Generation | **94.9 tok/s** | 77.8 tok/s | **1.22×** |
 | Binary size | **532 KB** | ~150 MB | 283× smaller |
 | Dependencies | cudart only | cuBLAS, cuDNN, etc. | — |
 
@@ -53,7 +53,7 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) with **zero external BLAS dep
 - **Built-in profiling**: `PROFILE=1` env var for per-category GPU timing breakdown
 
 ### cuBLAS Elimination (Phase 6)
-- **Custom GEMV kernel**: Vectorized 128-bit loads from DRAM, L2-cached x vector, bf162 packed operations, warp-level reduction. 8 warps/block = 8 rows/block. Matches cuBLAS within 2% for decode (memory-bound).
+- **Custom GEMV kernel**: Vectorized 128-bit loads from DRAM, L2-cached x vector, bf162 packed operations, warp-level reduction. 8 warps/block = 8 rows/block. **Streaming loads (`__ldcs`)** for weight data bypass L2 cache, preserving L2 for x-vector and intermediates across ~129 GEMV calls per decode step (+5% tok/s).
 - **wmma Tensor Core GEMM**: 64×64×16 tiled GEMM using `nvcuda::wmma` API for prompt eval. 4 warps (2×2), each computing 32×32 via 2×2 wmma 16×16 tiles. Achieves 97.5% of cuBLAS prompt throughput.
 - **Zero BLAS dependency**: Only links `libcudart.so`. Binary: 532KB (vs ~150MB with cuBLAS). No cuBLAS workspace allocation (~120ms startup saved).
 
@@ -75,25 +75,25 @@ Qwen3.5-9B is a **hybrid Mamba-Attention** model (delta-net linear attention):
 
 | Category | ms/tok | % | Notes |
 |----------|--------|---|-------|
-| FFN gate+up | 4.00 | 34.0% | 32×, N=24576 K=4096, 90% BW |
-| FFN down | 2.30 | 19.5% | 32×, N=4096 K=12288, 78% BW |
-| SSM GEMM | 2.34 | 19.9% | 24× combined+out |
-| LM head | 1.25 | 10.6% | 1×, N=248320 K=4096, 91% BW |
-| Attn GEMM | 0.69 | 5.8% | 8× packed wqkv+wo |
-| SSM step | 0.40 | 3.4% | 24× fused SSM (shared mem) |
-| Norms | 0.33 | 2.8% | Fused residual+norm |
-| Attn kernels | 0.27 | 2.3% | rope, deinterleave, kv_append, attention_decode |
-| FFN kernels | 0.11 | 0.9% | swiglu |
-| SSM conv | 0.09 | 0.7% | Fused conv1d+update |
-| **GEMM total** | **10.58** | **89.8%** | 13.7GB/tok, ~79% of 1792 GB/s |
+| FFN gate+up | 3.94 | 35.2% | 32×, N=24576 K=4096, 92% BW |
+| FFN down | 2.08 | 18.6% | 32×, N=4096 K=12288, 86% BW |
+| SSM GEMM | 2.12 | 19.0% | 24× combined+out |
+| LM head | 1.20 | 10.7% | 1×, N=248320 K=4096, 95% BW |
+| Attn GEMM | 0.61 | 5.5% | 8× packed wqkv+wo |
+| SSM step | 0.44 | 3.9% | 24× fused SSM (shared mem) |
+| Norms | 0.31 | 2.7% | Fused residual+norm |
+| Attn kernels | 0.29 | 2.6% | rope, deinterleave, kv_append, attention_decode |
+| FFN kernels | 0.09 | 0.8% | swiglu |
+| SSM conv | 0.10 | 0.9% | Fused conv1d+update |
+| **GEMM total** | **9.95** | **89.1%** | 13.7GB/tok, 77% of 1792 GB/s |
 
 ## Bandwidth Analysis
 
 - **Total weight bytes**: 13.7 GB/token (BF16)
 - **Theoretical minimum**: 13.7 GB / 1792 GB/s = 7.65 ms/tok (131 tok/s)
-- **Actual (graph mode, custom GEMV)**: ~11.0 ms/tok (90.7 tok/s) = **76% bandwidth utilization**
-- **Actual (graph mode, cuBLAS)**: ~10.8 ms/tok (92.5 tok/s) = **79% bandwidth utilization**
-- **Gap analysis**: Custom GEMV GEMM total is actually faster (10.02 vs 10.58 ms/tok in profiling), but CUDA graph launch characteristics differ slightly (-1.8%)
+- **Actual (graph mode, streaming GEMV)**: ~10.5 ms/tok (94.9 tok/s) = **80% bandwidth utilization**
+- **Actual (graph mode, non-streaming)**: ~11.0 ms/tok (90.7 tok/s) = **76% bandwidth utilization**
+- **Streaming loads**: `__ldcs` on weight data bypasses L2, improving both GEMV BW and non-GEMM kernel speed (intermediates stay in L2)
 
 ### cuBLAS Overhead Investigation
 
