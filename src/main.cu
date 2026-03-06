@@ -1049,9 +1049,13 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
             reset_state();
             prefix_len = 0;
         }
+        // Always prefill at least 1 token to avoid recomputing logits from stale state
+        if (prefix_len >= n_prompt) {
+            prefix_len = n_prompt - 1;
+        }
     }
 
-    int n_new = n_prompt - prefix_len;  // tokens to actually prefill
+    int n_new = n_prompt - prefix_len;  // tokens to actually prefill (always >= 1)
 
     // Clamp max_tokens so we don't exceed context during decode
     int remaining = max_kv - (g_model.kv_len + n_new);
@@ -1075,62 +1079,51 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
     {
         cudaStream_t s = g_model.compute_stream;
         int max_batch = g_model.max_tokens;
+        int alloc_size = (n_new < max_batch) ? n_new : max_batch;
 
-        if (n_new > 0) {
-            int alloc_size = (n_new < max_batch) ? n_new : max_batch;
+        int* tokens_d = cuda_alloc<int>(alloc_size);
+        int* pos_d = cuda_alloc<int>(alloc_size);
+        std::vector<int> positions(alloc_size);
 
-            int* tokens_d = cuda_alloc<int>(alloc_size);
-            int* pos_d = cuda_alloc<int>(alloc_size);
-            std::vector<int> positions(alloc_size);
+        int processed = 0;
+        int last_chunk = 0;
+        while (processed < n_new) {
+            last_chunk = n_new - processed;
+            if (last_chunk > max_batch) last_chunk = max_batch;
 
-            int processed = 0;
-            int last_chunk = 0;
-            while (processed < n_new) {
-                last_chunk = n_new - processed;
-                if (last_chunk > max_batch) last_chunk = max_batch;
+            cuda_upload(tokens_d, prompt_tokens.data() + prefix_len + processed, last_chunk);
+            for (int i = 0; i < last_chunk; i++) positions[i] = g_model.kv_len + i;
+            cuda_upload(pos_d, positions.data(), last_chunk);
 
-                cuda_upload(tokens_d, prompt_tokens.data() + prefix_len + processed, last_chunk);
-                for (int i = 0; i < last_chunk; i++) positions[i] = g_model.kv_len + i;
-                cuda_upload(pos_d, positions.data(), last_chunk);
+            int kv_params[2] = { g_model.kv_len, g_model.kv_len + last_chunk };
+            cuda_upload(g_model.d_kv_len, kv_params, 2);
 
-                int kv_params[2] = { g_model.kv_len, g_model.kv_len + last_chunk };
-                cuda_upload(g_model.d_kv_len, kv_params, 2);
+            embedding_to_f32_kernel<<<last_chunk, 1024, 0, s>>>(
+                g_model.hidden_state, g_model.tok_embd, tokens_d, MC::n_embd);
 
-                embedding_to_f32_kernel<<<last_chunk, 1024, 0, s>>>(
-                    g_model.hidden_state, g_model.tok_embd, tokens_d, MC::n_embd);
-
-                for (int il = 0; il < MC::n_layers; il++) {
-                    if (MC::is_recurrent(il)) {
-                        forward_ssm_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, last_chunk);
-                    } else {
-                        forward_attention_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, last_chunk, pos_d);
-                    }
+            for (int il = 0; il < MC::n_layers; il++) {
+                if (MC::is_recurrent(il)) {
+                    forward_ssm_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, last_chunk);
+                } else {
+                    forward_attention_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, last_chunk, pos_d);
                 }
-
-                g_model.kv_len += last_chunk;
-                processed += last_chunk;
             }
 
-            float* last_hidden = g_model.hidden_state + (last_chunk - 1) * MC::n_embd;
-            launch_rmsnorm_f32in(g_model.norm_out, last_hidden, g_model.output_norm,
-                1, MC::n_embd, MC::rms_norm_eps, s);
-            gemm_bf16_f32out(g_model.logits_f32, g_model.norm_out, g_model.output,
-                1, MC::n_vocab, MC::n_embd);
-
-            CUDA_CHECK(cudaStreamSynchronize(s));
-            next_token = sample_token(g_model.logits_f32, MC::n_vocab, g_temperature);
-
-            cudaFree(tokens_d);
-            cudaFree(pos_d);
-        } else {
-            // All prompt tokens cached — re-derive first token from last cached position
-            // Process last prompt token through decode to get logits
-            int last_tok = prompt_tokens[n_prompt - 1];
-            // kv_len already covers this token, so we need to recompute logits only
-            // Back up kv_len by 1, run one decode step to regenerate logits
-            g_model.kv_len--;
-            next_token = forward_decode(g_model, last_tok, g_model.kv_len);
+            g_model.kv_len += last_chunk;
+            processed += last_chunk;
         }
+
+        float* last_hidden = g_model.hidden_state + (last_chunk - 1) * MC::n_embd;
+        launch_rmsnorm_f32in(g_model.norm_out, last_hidden, g_model.output_norm,
+            1, MC::n_embd, MC::rms_norm_eps, s);
+        gemm_bf16_f32out(g_model.logits_f32, g_model.norm_out, g_model.output,
+            1, MC::n_vocab, MC::n_embd);
+
+        CUDA_CHECK(cudaStreamSynchronize(s));
+        next_token = sample_token(g_model.logits_f32, MC::n_vocab, g_temperature);
+
+        cudaFree(tokens_d);
+        cudaFree(pos_d);
     }
 
     // Update cached token sequence (prompt portion)
