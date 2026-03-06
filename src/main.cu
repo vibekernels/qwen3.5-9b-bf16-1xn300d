@@ -36,10 +36,10 @@ void launch_swiglu_packed(__nv_bfloat16* output, const __nv_bfloat16* packed,
 void launch_sigmoid_mul(__nv_bfloat16* output, const __nv_bfloat16* attn_out,
     const __nv_bfloat16* gate, int n_elements, cudaStream_t stream);
 void launch_kv_cache_append(__nv_bfloat16* cache, const __nv_bfloat16* new_kv,
-    int kv_pos, int n_new_tokens, int kv_dim, cudaStream_t stream);
+    const int* d_kv_pos, int n_new_tokens, int kv_dim, cudaStream_t stream);
 void launch_attention_decode(__nv_bfloat16* output, const __nv_bfloat16* q,
     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
-    int kv_len, int n_head, int n_head_kv, int head_dim, float scale, cudaStream_t stream);
+    const int* d_kv_len, int max_kv_len, int n_head, int n_head_kv, int head_dim, float scale, cudaStream_t stream);
 void launch_attention_prefill(__nv_bfloat16* output, const __nv_bfloat16* q,
     const __nv_bfloat16* k_cache, const __nv_bfloat16* v_cache,
     int n_tokens, int kv_start, int n_head, int n_head_kv, int head_dim, float scale, cudaStream_t stream);
@@ -318,6 +318,15 @@ static void allocate_buffers(Model& model, int max_batch, int max_kv_len) {
         model.ssm_recurrent_state[i] = cuda_alloc<float>(recurrent_state_size);
         CUDA_CHECK(cudaMemset(model.ssm_recurrent_state[i], 0, recurrent_state_size * sizeof(float)));
     }
+
+    // CUDA graph support
+    // d_kv_len[0] = kv_pos (for kv_cache_append), d_kv_len[1] = total_kv_len (for attention_decode)
+    model.d_kv_len = cuda_alloc<int>(2);
+    CUDA_CHECK(cudaStreamCreate(&model.compute_stream));
+    cublasSetStream(model.cublas_handle, model.compute_stream);
+    model.decode_graph = nullptr;
+    model.decode_graph_exec = nullptr;
+    model.decode_graph_captured = false;
 }
 
 // Residual add: f32 output = f32 a + f32 b
@@ -338,9 +347,10 @@ static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
     float* hidden, int n_tokens, int* positions_d) {
     auto& lw = model.attn_layers[attn_idx];
     auto handle = model.cublas_handle;
+    cudaStream_t s = model.compute_stream;
 
     // 1. RMSNorm (f32 in, bf16 out)
-    launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, 0);
+    launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
 
     // 2. Q+Gate projection: [n_tokens, 4096] -> [n_tokens, 8192]
     gemm_bf16(handle, model.qkv_buf, model.norm_out, lw.wq, n_tokens, MC::n_head * MC::head_dim * 2, MC::n_embd);
@@ -368,56 +378,56 @@ static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
     __nv_bfloat16* gate_buf = model.hidden_bf16;
     {
         int total = n_tokens * MC::n_head * MC::head_dim;
-        deinterleave_qg_kernel<<<cdiv(total, 256), 256>>>(
+        deinterleave_qg_kernel<<<cdiv(total, 256), 256, 0, s>>>(
             q_contiguous, gate_buf, model.qkv_buf, n_tokens * MC::n_head, MC::head_dim);
     }
 
     // Q/K norm
     launch_rmsnorm_head(q_contiguous, q_contiguous, lw.attn_q_norm,
-        n_tokens, MC::n_head, MC::head_dim, MC::rms_norm_eps, 0);
+        n_tokens, MC::n_head, MC::head_dim, MC::rms_norm_eps, s);
     launch_rmsnorm_head(k_proj, k_proj, lw.attn_k_norm,
-        n_tokens, MC::n_head_kv, MC::head_dim, MC::rms_norm_eps, 0);
+        n_tokens, MC::n_head_kv, MC::head_dim, MC::rms_norm_eps, s);
 
     // 6. RoPE on Q and K
     launch_rope(q_contiguous, positions_d, n_tokens, MC::n_head, MC::head_dim,
-        MC::rope_dim, MC::rope_freq_base, 0);
+        MC::rope_dim, MC::rope_freq_base, s);
     launch_rope(k_proj, positions_d, n_tokens, MC::n_head_kv, MC::head_dim,
-        MC::rope_dim, MC::rope_freq_base, 0);
+        MC::rope_dim, MC::rope_freq_base, s);
 
-    // 7. Append K, V to cache
-    launch_kv_cache_append(model.k_cache[attn_idx], k_proj, model.kv_len, n_tokens, kv_dim, 0);
-    launch_kv_cache_append(model.v_cache[attn_idx], v_proj, model.kv_len, n_tokens, kv_dim, 0);
+    // 7. Append K, V to cache (d_kv_len has current kv_len value)
+    launch_kv_cache_append(model.k_cache[attn_idx], k_proj, model.d_kv_len, n_tokens, kv_dim, s);
+    launch_kv_cache_append(model.v_cache[attn_idx], v_proj, model.d_kv_len, n_tokens, kv_dim, s);
 
     // 8. Attention (use prefill kernel for n_tokens > 1)
     if (n_tokens > 1) {
         launch_attention_prefill(model.attn_out, q_contiguous,
             model.k_cache[attn_idx], model.v_cache[attn_idx],
-            n_tokens, model.kv_len, MC::n_head, MC::n_head_kv, MC::head_dim, MC::attn_scale, 0);
+            n_tokens, model.kv_len, MC::n_head, MC::n_head_kv, MC::head_dim, MC::attn_scale, s);
     } else {
-        int total_kv_len = model.kv_len + n_tokens;
+        // d_kv_len[1] has kv_len + n_tokens (total entries after append)
         launch_attention_decode(model.attn_out, q_contiguous,
             model.k_cache[attn_idx], model.v_cache[attn_idx],
-            total_kv_len, MC::n_head, MC::n_head_kv, MC::head_dim, MC::attn_scale, 0);
+            model.d_kv_len + 1, model.max_kv_len, MC::n_head, MC::n_head_kv, MC::head_dim, MC::attn_scale, s);
     }
 
     // 9. Sigmoid gate
     launch_sigmoid_mul(model.attn_out, model.attn_out, gate_buf,
-        n_tokens * MC::n_head * MC::head_dim, 0);
+        n_tokens * MC::n_head * MC::head_dim, s);
 
     // 10. Output projection -> bf16
     gemm_bf16(handle, model.attn_out, model.attn_out, lw.wo, n_tokens, MC::n_embd, MC::n_head * MC::head_dim);
 
     // 11. Fused bf16 cast + residual + post-attention norm (saves cast kernel)
     launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, model.attn_out,
-        lw.post_attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, 0);
+        lw.post_attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
 
     // FFN: fused gate+up GEMM, then SwiGLU from packed layout
     gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, n_tokens, 2 * MC::n_ff, MC::n_embd);
-    launch_swiglu_packed(model.ffn_buf, model.ffn_buf, n_tokens, MC::n_ff, 0);
+    launch_swiglu_packed(model.ffn_buf, model.ffn_buf, n_tokens, MC::n_ff, s);
 
     // down_proj -> bf16, then fused bf16 residual add
     gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
-    launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, 0);
+    launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, s);
 }
 
 // Forward pass for one SSM (delta-net) layer
@@ -426,9 +436,10 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
     float* hidden, int n_tokens) {
     auto& lw = model.ssm_layers[ssm_idx];
     auto handle = model.cublas_handle;
+    cudaStream_t s = model.compute_stream;
 
     // 1. RMSNorm (f32 in, bf16 out)
-    launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, 0);
+    launch_rmsnorm_f32in(model.norm_out, hidden, lw.attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
 
     // Pointers to SSM projection outputs
     float* qkv_proj;     // [n_tokens, ssm_conv_channels=8192]
@@ -458,18 +469,19 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
         gemm_bf16(handle, combined_bf16, model.norm_out, lw.w_combined, n_tokens, combined_n, MC::n_embd);
         // Fused deinterleave + bf16→f32 cast
         int total = n_tokens * combined_n;
-        deinterleave_ssm_proj_bf16_kernel<<<cdiv(total, 256), 256>>>(
+        deinterleave_ssm_proj_bf16_kernel<<<cdiv(total, 256), 256, 0, s>>>(
             qkv_proj, z_buf, alpha_f32, beta_raw_f32,
             combined_bf16, n_tokens, MC::ssm_conv_channels, MC::ssm_d_inner, MC::ssm_dt_rank, combined_n);
     }
 
     // 6. Conv1d + SiLU on QKV mixed (f32 in, f32 out, batched)
     launch_conv1d_silu(model.ssm_conv_out_buf, qkv_proj, model.ssm_conv_state[ssm_idx],
-        lw.ssm_conv1d, n_tokens, MC::ssm_conv_channels, MC::ssm_conv_kernel, 0);
+        lw.ssm_conv1d, n_tokens, MC::ssm_conv_channels, MC::ssm_conv_kernel, s);
 
     // Update conv state (f32 input)
     launch_update_conv_state(model.ssm_conv_state[ssm_idx], qkv_proj,
-        model.ssm_conv_state[ssm_idx], n_tokens, MC::ssm_conv_channels, MC::ssm_conv_kernel, 0);
+        model.ssm_conv_state[ssm_idx], n_tokens, MC::ssm_conv_channels, MC::ssm_conv_kernel, s);
+
     // 7-13. Fused SSM step
     float scale = 1.0f / sqrtf((float)MC::ssm_d_state);
 
@@ -482,7 +494,7 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
             z_buf, lw.ssm_norm,
             MC::ssm_n_group, MC::ssm_dt_rank,
             MC::ssm_d_state, MC::ssm_head_v_dim,
-            scale, MC::rms_norm_eps, MC::rms_norm_eps, 0);
+            scale, MC::rms_norm_eps, MC::rms_norm_eps, s);
     } else {
         launch_fused_ssm_step_batched(
             model.norm_out,
@@ -493,7 +505,7 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
             MC::ssm_n_group, MC::ssm_dt_rank,
             MC::ssm_d_state, MC::ssm_head_v_dim,
             MC::ssm_conv_channels, MC::ssm_d_inner,
-            scale, MC::rms_norm_eps, MC::rms_norm_eps, 0);
+            scale, MC::rms_norm_eps, MC::rms_norm_eps, s);
     }
 
     // 14. Output projection -> bf16
@@ -501,15 +513,15 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
 
     // 15. Fused bf16 cast + residual + post-attention norm
     launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, model.attn_out,
-        lw.post_attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, 0);
+        lw.post_attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, s);
 
     // FFN: fused gate+up GEMM, then SwiGLU from packed layout
     gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, n_tokens, 2 * MC::n_ff, MC::n_embd);
-    launch_swiglu_packed(model.ffn_buf, model.ffn_buf, n_tokens, MC::n_ff, 0);
+    launch_swiglu_packed(model.ffn_buf, model.ffn_buf, n_tokens, MC::n_ff, s);
 
     // down_proj -> bf16, then fused bf16 residual add
     gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
-    launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, 0);
+    launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, s);
 }
 
 // Global temperature (set from command line)
@@ -542,42 +554,65 @@ static void ensure_decode_bufs() {
     if (!g_pos_d) g_pos_d = cuda_alloc<int>(1);
 }
 
-// Full forward pass for n_tokens=1 (decode step)
-static int forward_decode(Model& model, int token_id, int position) {
-    int n_tokens = 1;
-    ensure_decode_bufs();
-
-    cuda_upload(g_token_d, &token_id, 1);
-    cuda_upload(g_pos_d, &position, 1);
+// Execute decode forward pass body (embedding through LM head)
+// All operations go to model.compute_stream
+static void forward_decode_body(Model& model) {
+    cudaStream_t s = model.compute_stream;
 
     // Embedding lookup -> f32 hidden state
-    embedding_to_f32_kernel<<<n_tokens, 1024>>>(
+    embedding_to_f32_kernel<<<1, 1024, 0, s>>>(
         model.hidden_state, model.tok_embd, g_token_d, MC::n_embd);
 
     // Process all layers
     for (int il = 0; il < MC::n_layers; il++) {
         if (MC::is_recurrent(il)) {
-            forward_ssm_layer(model, il, model.layer_subidx[il], model.hidden_state, n_tokens);
+            forward_ssm_layer(model, il, model.layer_subidx[il], model.hidden_state, 1);
         } else {
-            forward_attention_layer(model, il, model.layer_subidx[il], model.hidden_state, n_tokens, g_pos_d);
+            forward_attention_layer(model, il, model.layer_subidx[il], model.hidden_state, 1, g_pos_d);
         }
     }
 
-    // Update KV cache position
-    model.kv_len += n_tokens;
-
     // Final norm: f32 in, bf16 out
     launch_rmsnorm_f32in(model.norm_out, model.hidden_state, model.output_norm,
-        n_tokens, MC::n_embd, MC::rms_norm_eps, 0);
+        1, MC::n_embd, MC::rms_norm_eps, s);
 
     // LM head: [1, 4096] -> [1, 248320] -> f32 logits
     gemm_bf16_f32out(model.cublas_handle, model.logits_f32, model.norm_out, model.output,
-        n_tokens, MC::n_vocab, MC::n_embd);
+        1, MC::n_vocab, MC::n_embd);
+}
 
-    // Sample (does its own sync internally)
-    int next_token = sample_token(model.logits_f32, MC::n_vocab, g_temperature);
+// Full forward pass for n_tokens=1 (decode step) with CUDA graph acceleration
+static int forward_decode(Model& model, int token_id, int position) {
+    ensure_decode_bufs();
+    cudaStream_t s = model.compute_stream;
 
-    return next_token;
+    // Upload variable parameters (before graph launch, on same stream for ordering)
+    int kv_params[2] = { model.kv_len, model.kv_len + 1 };
+    CUDA_CHECK(cudaMemcpyAsync(g_token_d, &token_id, sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(g_pos_d, &position, sizeof(int), cudaMemcpyHostToDevice, s));
+    CUDA_CHECK(cudaMemcpyAsync(model.d_kv_len, kv_params, 2 * sizeof(int), cudaMemcpyHostToDevice, s));
+
+    if (!model.decode_graph_captured) {
+        // First decode: capture the compute graph
+        CUDA_CHECK(cudaStreamBeginCapture(s, cudaStreamCaptureModeGlobal));
+        forward_decode_body(model);
+        CUDA_CHECK(cudaStreamEndCapture(s, &model.decode_graph));
+        CUDA_CHECK(cudaGraphInstantiate(&model.decode_graph_exec, model.decode_graph, nullptr, nullptr, 0));
+        model.decode_graph_captured = true;
+
+        // Launch the captured graph (capture doesn't execute)
+        CUDA_CHECK(cudaGraphLaunch(model.decode_graph_exec, s));
+    } else {
+        // Replay the captured graph
+        CUDA_CHECK(cudaGraphLaunch(model.decode_graph_exec, s));
+    }
+
+    // Update KV cache position (CPU-side)
+    model.kv_len += 1;
+
+    // Sync and sample (outside graph)
+    CUDA_CHECK(cudaStreamSynchronize(s));
+    return sample_token(model.logits_f32, MC::n_vocab, g_temperature);
 }
 
 static void print_usage(const char* prog) {
@@ -643,13 +678,20 @@ int main(int argc, char** argv) {
     int max_kv_len = (int)prompt_tokens.size() + max_gen_tokens + 16;
     allocate_buffers(model, max_batch, max_kv_len);
 
-    // Warm up cuBLAS (first call allocates workspace)
+    // Warm up cuBLAS on compute stream (first call allocates workspace)
     {
         __nv_bfloat16* dummy_a = model.norm_out;
         __nv_bfloat16* dummy_b = model.norm_out;
         __nv_bfloat16* dummy_c = model.attn_out;
         gemm_bf16(model.cublas_handle, dummy_c, dummy_a, dummy_b, 1, 64, 64);
-        cudaDeviceSynchronize();
+        // Also warm up the specific GEMM sizes used during decode (cuBLAS caches kernel plans)
+        static constexpr int combined_n = MC::ssm_conv_channels + MC::ssm_d_inner + MC::ssm_dt_rank + MC::ssm_dt_rank;
+        gemm_bf16_f32out(model.cublas_handle, model.gemm_out, dummy_a, model.ssm_layers[0].w_combined, 1, combined_n, MC::n_embd);
+        gemm_bf16(model.cublas_handle, dummy_c, dummy_a, model.ssm_layers[0].ssm_out, 1, MC::n_embd, MC::ssm_d_inner);
+        gemm_bf16(model.cublas_handle, model.ffn_buf, dummy_c, model.ssm_layers[0].ffn_gate_up, 1, 2 * MC::n_ff, MC::n_embd);
+        gemm_bf16(model.cublas_handle, dummy_c, model.ffn_buf, model.ssm_layers[0].ffn_down, 1, MC::n_embd, MC::n_ff);
+        gemm_bf16_f32out(model.cublas_handle, model.logits_f32, dummy_a, model.output, 1, MC::n_vocab, MC::n_embd);
+        CUDA_CHECK(cudaStreamSynchronize(model.compute_stream));
     }
 
     printf("\nGenerating...\n");
@@ -660,6 +702,8 @@ int main(int argc, char** argv) {
     int n_prompt = (int)prompt_tokens.size();
     int next_token = -1;
     {
+        cudaStream_t s = model.compute_stream;
+
         // Upload all token IDs and positions
         int* tokens_d = cuda_alloc<int>(n_prompt);
         int* pos_d = cuda_alloc<int>(n_prompt);
@@ -668,8 +712,12 @@ int main(int argc, char** argv) {
         for (int i = 0; i < n_prompt; i++) positions[i] = i;
         cuda_upload(pos_d, positions.data(), n_prompt);
 
+        // Upload kv_len for attention layers (kv_len=0 at start)
+        int kv_params[2] = { model.kv_len, model.kv_len + n_prompt };
+        cuda_upload(model.d_kv_len, kv_params, 2);
+
         // Embedding lookup for all prompt tokens -> f32 hidden state
-        embedding_to_f32_kernel<<<n_prompt, 1024>>>(
+        embedding_to_f32_kernel<<<n_prompt, 1024, 0, s>>>(
             model.hidden_state, model.tok_embd, tokens_d, MC::n_embd);
 
         // Process all layers with batched tokens
@@ -687,12 +735,13 @@ int main(int argc, char** argv) {
         // Final norm on last token only
         float* last_hidden = model.hidden_state + (n_prompt - 1) * MC::n_embd;
         launch_rmsnorm_f32in(model.norm_out, last_hidden, model.output_norm,
-            1, MC::n_embd, MC::rms_norm_eps, 0);
+            1, MC::n_embd, MC::rms_norm_eps, s);
 
         // LM head on last token
         gemm_bf16_f32out(model.cublas_handle, model.logits_f32, model.norm_out, model.output,
             1, MC::n_vocab, MC::n_embd);
 
+        CUDA_CHECK(cudaStreamSynchronize(s));
         next_token = sample_token(model.logits_f32, MC::n_vocab, g_temperature);
 
         cudaFree(tokens_d);

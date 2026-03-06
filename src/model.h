@@ -158,6 +158,13 @@ struct Model {
     int max_kv_len;                  // max KV cache length
     int kv_len;                      // current KV cache length
 
+    // CUDA graph for decode acceleration
+    int* d_kv_len;                   // kv_len on device (for graph-captured attention)
+    cudaStream_t compute_stream;     // non-default stream for graph capture
+    cudaGraph_t decode_graph;
+    cudaGraphExec_t decode_graph_exec;
+    bool decode_graph_captured;
+
     void init_layer_mapping() {
         int attn_idx = 0, ssm_idx = 0;
         for (int i = 0; i < ModelConfig::n_layers; i++) {

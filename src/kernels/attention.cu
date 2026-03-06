@@ -54,13 +54,15 @@ void launch_sigmoid_mul(
 // Append K,V to cache at position kv_pos
 // K_new: [n_new_tokens, n_head_kv * head_dim]
 // k_cache: [max_kv_len, n_head_kv * head_dim]
+// kv_pos read from device pointer (for CUDA graph compatibility)
 __global__ void kv_cache_append_kernel(
     __nv_bfloat16* __restrict__ cache,
     const __nv_bfloat16* __restrict__ new_kv,
-    int kv_pos,          // starting position in cache
+    const int* __restrict__ d_kv_pos,
     int n_new_tokens,
     int kv_dim           // n_head_kv * head_dim
 ) {
+    int kv_pos = *d_kv_pos;
     int token = blockIdx.x;
     int tid = threadIdx.x;
     int stride = blockDim.x;
@@ -76,7 +78,7 @@ __global__ void kv_cache_append_kernel(
 void launch_kv_cache_append(
     __nv_bfloat16* cache,
     const __nv_bfloat16* new_kv,
-    int kv_pos,
+    const int* d_kv_pos,
     int n_new_tokens,
     int kv_dim,
     cudaStream_t stream
@@ -84,7 +86,7 @@ void launch_kv_cache_append(
     int threads = (kv_dim < 1024) ? kv_dim : 1024;
     threads = ((threads + 31) / 32) * 32;
     kv_cache_append_kernel<<<n_new_tokens, threads, 0, stream>>>(
-        cache, new_kv, kv_pos, n_new_tokens, kv_dim);
+        cache, new_kv, d_kv_pos, n_new_tokens, kv_dim);
 }
 
 // Naive attention: Q @ K^T with causal masking, softmax, then @ V
@@ -100,17 +102,19 @@ void launch_kv_cache_append(
 // Compute attention scores for one query head against one KV head
 // score[i] = Q[q_token, head] . K[i, kv_head] / scale
 // Then softmax, then weighted sum of V
+// kv_len read from device pointer (for CUDA graph compatibility)
 __global__ void attention_decode_kernel(
     __nv_bfloat16* __restrict__ output,    // [n_head, head_dim]
     const __nv_bfloat16* __restrict__ q,   // [n_head, head_dim]
     const __nv_bfloat16* __restrict__ k_cache,  // [kv_len, n_head_kv, head_dim]
     const __nv_bfloat16* __restrict__ v_cache,  // [kv_len, n_head_kv, head_dim]
-    int kv_len,
+    const int* __restrict__ d_kv_len,
     int n_head,
     int n_head_kv,
     int head_dim,
     float scale
 ) {
+    int kv_len = *d_kv_len;
     // Each block handles one Q head
     const int head = blockIdx.x;
     const int kv_head = head / (n_head / n_head_kv); // GQA mapping
@@ -331,16 +335,17 @@ void launch_attention_decode(
     const __nv_bfloat16* q,
     const __nv_bfloat16* k_cache,
     const __nv_bfloat16* v_cache,
-    int kv_len,
+    const int* d_kv_len,
+    int max_kv_len,
     int n_head,
     int n_head_kv,
     int head_dim,
     float scale,
     cudaStream_t stream
 ) {
-    // One block per head, use shared memory for scores
+    // One block per head, allocate smem for max possible kv_len (for graph capture)
     int threads = 256;
-    size_t smem = kv_len * sizeof(float);
+    size_t smem = max_kv_len * sizeof(float);
     attention_decode_kernel<<<n_head, threads, smem, stream>>>(
-        output, q, k_cache, v_cache, kv_len, n_head, n_head_kv, head_dim, scale);
+        output, q, k_cache, v_cache, d_kv_len, n_head, n_head_kv, head_dim, scale);
 }
