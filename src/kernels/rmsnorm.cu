@@ -222,6 +222,94 @@ void launch_fused_residual_rmsnorm(
         norm_output, hidden, residual, weight, dim, eps);
 }
 
+// Fused: cast bf16 residual to f32, add to hidden, then RMSNorm to bf16
+// Eliminates separate bf16->f32 cast kernel
+__global__ void fused_bf16_residual_rmsnorm_kernel(
+    __nv_bfloat16* __restrict__ norm_output,
+    float* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ residual_bf16,
+    const float* __restrict__ weight,
+    int dim,
+    float eps
+) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int stride = blockDim.x;
+
+    float* h = hidden + row * dim;
+    const __nv_bfloat16* r = residual_bf16 + row * dim;
+    __nv_bfloat16* y = norm_output + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = tid; i < dim; i += stride) {
+        float val = h[i] + __bfloat162float(r[i]);
+        h[i] = val;
+        sum_sq += val * val;
+    }
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+    }
+    __shared__ float shared[32];
+    int warp_id = tid / 32;
+    int lane_id = tid % 32;
+    if (lane_id == 0) shared[warp_id] = sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+        sum_sq = (lane_id < (stride / 32)) ? shared[lane_id] : 0.0f;
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            sum_sq += __shfl_down_sync(0xffffffff, sum_sq, offset);
+        }
+    }
+    __shared__ float s_rms_scale;
+    if (tid == 0) {
+        s_rms_scale = rsqrtf(sum_sq / dim + eps);
+    }
+    __syncthreads();
+
+    float rms_scale = s_rms_scale;
+    for (int i = tid; i < dim; i += stride) {
+        y[i] = __float2bfloat16(h[i] * rms_scale * weight[i]);
+    }
+}
+
+void launch_fused_bf16_residual_rmsnorm(
+    __nv_bfloat16* norm_output,
+    float* hidden,
+    const __nv_bfloat16* residual_bf16,
+    const float* weight,
+    int n_tokens,
+    int dim,
+    float eps,
+    cudaStream_t stream
+) {
+    int threads = (dim < 1024) ? dim : 1024;
+    threads = ((threads + 31) / 32) * 32;
+    fused_bf16_residual_rmsnorm_kernel<<<n_tokens, threads, 0, stream>>>(
+        norm_output, hidden, residual_bf16, weight, dim, eps);
+}
+
+// Fused: cast bf16 to f32 + residual add (for FFN down proj)
+__global__ void bf16_residual_add_kernel(
+    float* __restrict__ hidden,
+    const __nv_bfloat16* __restrict__ residual_bf16,
+    int n
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        hidden[idx] += __bfloat162float(residual_bf16[idx]);
+    }
+}
+
+void launch_bf16_residual_add(
+    float* hidden,
+    const __nv_bfloat16* residual_bf16,
+    int n,
+    cudaStream_t stream
+) {
+    bf16_residual_add_kernel<<<cdiv(n, 256), 256, 0, stream>>>(hidden, residual_bf16, n);
+}
+
 // RMSNorm applied per-head (for Q/K normalization)
 // Input shape: [n_tokens, n_heads, head_dim]
 // Weight shape: [head_dim]

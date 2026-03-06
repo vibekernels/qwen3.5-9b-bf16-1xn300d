@@ -1,90 +1,57 @@
 # CUDA Migration Progress: Qwen3.5-9B Inference
 
-## Status: Phase 1 Complete (Correct Forward Pass)
+## Status: Phase 2 Complete (Optimized — Faster than llama.cpp)
 
-The custom CUDA inference engine produces correct output for Qwen3.5-9B (BF16). The model generates coherent, accurate text matching the llama.cpp reference implementation.
+Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on both prompt eval and generation.
 
-**Example**: Prompt "The capital of France is" → generates "Paris" (matching llama.cpp output).
+## Performance (RTX 5090, BF16)
 
-## Performance (RTX 5090, BF16, batch-1)
+| Metric | Our Implementation | llama.cpp | Speedup |
+|--------|-------------------|-----------|---------|
+| Prompt eval (111 tok) | **1480 tok/s** | 651 tok/s | **2.27×** |
+| Prompt eval (211 tok) | **1099 tok/s** | 1041 tok/s | **1.06×** |
+| Generation | **83.5 tok/s** | 75.3 tok/s | **1.11×** |
 
-| Metric | Value |
-|---|---|
-| Prompt eval | ~25 tok/s |
-| Generation | ~69 tok/s |
+## Phase 2 Optimizations Applied
 
-These are unoptimized Phase 1 numbers. Phase 2 optimizations (FlashAttention, fused kernels, CUDA graphs) have not been applied yet.
+### Weight Packing (Reduced GEMM launches)
+- **Attention K+V packed**: Single GEMM for K+V during decode (saves 1 cuBLAS call per layer)
+- **FFN gate+up packed**: Single GEMM for gate+up with `swiglu_packed` kernel (saves 1 per layer)
+- **SSM combined projection**: Packed QKV+Z+alpha+beta into single GEMM with fused bf16 deinterleave (4→1 GEMM for batched SSM)
+
+### Fused Kernels (Reduced kernel launches)
+- **Fused residual + RMSNorm**: Combines residual add + norm in one kernel (2 launches → 1)
+- **Fused bf16 residual + RMSNorm**: Cast bf16→f32 + residual + norm in one kernel (3 launches → 1)
+- **Fused bf16 residual add**: Cast + add for FFN down output (2 launches → 1)
+- **Fused SSM step**: Combines gate compute, beta sigmoid, L2 norm, repeat heads, delta-net decode, gated RMSNorm (7 ops → 1 kernel)
+- **SwiGLU packed**: Works directly on interleaved gate+up GEMM output
+
+### SSM Recurrence Optimization
+- **Batched SSM kernel**: All prompt tokens processed in a single kernel launch (n_tokens launches → 1)
+- **Shared memory state**: 64KB state matrix (128×128) kept in shared memory during batched recurrence (4.8× faster — 93ms→19ms for 24 SSM layers on 111 tokens)
+
+### Adaptive GEMM Strategy
+- **M≤4**: Direct bf16→f32 output (decode path, saves cast)
+- **M>4**: bf16→bf16 GEMM + fused bf16→f32 cast in downstream kernel (faster cuBLAS kernels)
+- **cuBLAS warm-up**: Pre-warm cuBLAS workspace before timing
+
+### Other
+- GPU argmax sampling (avoids downloading 248K float logits)
+- Pre-allocated decode buffers (avoids per-token cudaMalloc)
+- Batched prompt processing through all layers
 
 ## Architecture
 
-Qwen3.5-9B is a **hybrid Mamba-Attention** model (delta-net linear attention, not Mamba2):
+Qwen3.5-9B is a **hybrid Mamba-Attention** model (delta-net linear attention):
 
-- 32 layers total
-- SSM (delta-net) layers: positions where `(i+1) % 4 != 0` (layers 0-2, 4-6, 8-10, ...)
-- Full attention layers: positions 3, 7, 11, 15, 19, 23, 27, 31
+- 32 layers: 24 SSM (delta-net) + 8 full attention (at positions 3,7,11,...,31)
 - Hidden dim: 4096, FFN dim: 12288, vocab: 248,320
 - Attention: 16 Q heads, 4 KV heads (GQA 4:1), head_dim=256
 - SSM: d_state=128, n_group=16, dt_rank=32, conv_kernel=4
 
-## Codebase (~2,765 lines)
+## Build & Run
 
+```sh
+make -j
+./qwen-inference /path/to/qwen3.5-9b-bf16.gguf -p "Your prompt here" -n 128 -t 0
 ```
-src/
-  main.cu             (756)  - Entry point, inference loop, forward pass
-  model.h             (161)  - Model config, weight structs, buffer allocation
-  gguf_loader.h/cpp   (320)  - GGUF V3 parser, BF16 weight loading to GPU
-  tokenizer.h/cpp     (312)  - BPE tokenizer (encode/decode)
-  sampling.h/cu       (111)  - Top-k/p sampling with temperature
-  utils.h              (47)  - CUDA error checking macros
-  kernels/
-    mamba.cu           (466)  - Delta-net SSM: conv1d, selective scan, gated RMSNorm
-    rmsnorm.cu         (222)  - RMSNorm (bf16, f32-input, per-head variants)
-    attention.cu       (221)  - GQA attention with KV cache
-    rope.cu             (72)  - RoPE with dimension_sections
-    embedding.cu        (39)  - Token embedding lookup
-    ffn.cu              (38)  - SwiGLU FFN
-```
-
-All linear projections use cuBLAS `cublasGemmEx` with `CUBLAS_COMPUTE_32F` for BF16 GEMM.
-
-## Bugs Found and Fixed
-
-### 1. repeat_heads mapping (CRITICAL - wrong output)
-**File**: `src/kernels/mamba.cu:447`
-
-The delta-net SSM has 16 groups but 32 value heads. Q and K must be repeated from 16 → 32 heads to match. The mapping was wrong:
-
-- **Bug**: `k_head = v_head * num_k_heads / num_v_heads` — interleaved mapping `[g0,g0,g1,g1,...,g15,g15]`
-- **Fix**: `k_head = v_head % num_k_heads` — tiled mapping `[g0,g1,...,g15,g0,g1,...,g15]` matching ggml's `ggml_repeat_4d` semantics
-
-This was the root cause of garbled output. Only head 0 happened to map correctly under both schemes, which is why per-head analysis showed cos_sim=1.0 for head 0 but wrong magnitudes for others.
-
-### 2. Z gate BF16 precision loss
-**File**: `src/kernels/mamba.cu`
-
-The z gate values in the gated RMSNorm were being truncated to BF16 before the SiLU activation, losing precision on small values. Fixed by keeping z in f32 through the gate computation.
-
-### 3. L2 norm formula
-**File**: `src/kernels/mamba.cu`
-
-The L2 normalization for Q and K vectors used an incorrect formula. Fixed to match the reference implementation's `l2_norm` behavior.
-
-## Debugging Methodology
-
-Systematic per-layer comparison between CUDA and ggml reference:
-
-1. **Built custom ggml dump tool** (`dump_ggml_hidden.cpp`) — hooks into llama.cpp's eval callback to dump intermediate tensors (linear_attn_out, ffn_out, attn_output, z, conv outputs) per token position
-2. **Added CUDA dump infrastructure** — environment variables (`DUMP_SSM_INTERMEDIATES`, `DUMP_ATTN_INTERMEDIATES`, `DUMP_ALL_LAYERS`) trigger binary dumps of hidden states
-3. **Python comparison script** (`compare_layers.py`) — reconstructs cumulative hidden states from incremental outputs and computes max_diff/cosine_similarity per layer
-4. **Narrowed divergence** — embedding matched exactly (max_diff=0.0), SSM layer 0 output had cos_sim=0.993 but wrong magnitude, traced to Q/K head mapping
-
-Key insight: cos_sim=1.0 per head with wrong magnitudes meant V (determining direction) was correct but Q*K dot products (determining magnitude) were wrong — pointed to head mapping rather than computation bugs.
-
-## What's Next (Phase 2)
-
-- FlashAttention or cuDNN fused attention for the 8 attention layers
-- Fused kernels: RMSNorm+residual, SwiGLU activation
-- CUDA graphs for single-token decode
-- Memory pool pre-allocation
-- Specialized GEMV kernels for batch-1 decode
-- Profiling with Nsight Compute/Systems

@@ -21,6 +21,9 @@ void launch_rmsnorm_f32in(__nv_bfloat16* output, const float* input,
     const float* weight, int n_tokens, int dim, float eps, cudaStream_t stream);
 void launch_fused_residual_rmsnorm(__nv_bfloat16* norm_output, float* hidden,
     const float* residual, const float* weight, int n_tokens, int dim, float eps, cudaStream_t stream);
+void launch_fused_bf16_residual_rmsnorm(__nv_bfloat16* norm_output, float* hidden,
+    const __nv_bfloat16* residual_bf16, const float* weight, int n_tokens, int dim, float eps, cudaStream_t stream);
+void launch_bf16_residual_add(float* hidden, const __nv_bfloat16* residual_bf16, int n, cudaStream_t stream);
 void launch_rmsnorm_head(__nv_bfloat16* output, const __nv_bfloat16* input,
     const float* weight, int n_tokens, int n_heads, int head_dim,
     float eps, cudaStream_t stream);
@@ -60,9 +63,17 @@ void launch_gated_rmsnorm(__nv_bfloat16* output, const float* input,
 void launch_repeat_heads(float* output, const float* input,
     int num_k_heads, int num_v_heads, int head_dim, cudaStream_t stream);
 void launch_fused_ssm_step(__nv_bfloat16* output, float* state,
-    const float* conv_out, const float* gate, const float* beta,
-    const float* z, const float* norm_weight,
+    const float* conv_out, const float* alpha, const float* dt_bias,
+    const float* ssm_a, const float* beta_raw, const float* z,
+    const float* norm_weight,
     int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim,
+    float scale, float l2_eps, float rms_eps, cudaStream_t stream);
+void launch_fused_ssm_step_batched(__nv_bfloat16* output, float* state,
+    const float* conv_out, const float* alpha, const float* dt_bias,
+    const float* ssm_a, const float* beta_raw, const float* z,
+    const float* norm_weight, int n_tokens,
+    int num_k_heads, int num_v_heads, int head_k_dim, int head_v_dim,
+    int conv_channels, int d_inner,
     float scale, float l2_eps, float rms_eps, cudaStream_t stream);
 
 using MC = ModelConfig;
@@ -114,8 +125,8 @@ static void gemm_bf16_f32out(
 ) {
     float alpha = 1.0f, beta_val = 0.0f;
 
-    if (M <= 1) {
-        // Decode path: direct f32 output, saves a cast kernel
+    if (M <= 4) {
+        // Small M: direct f32 output saves a cast kernel
         CUBLAS_CHECK(cublasGemmEx(
             handle,
             CUBLAS_OP_T, CUBLAS_OP_N,
@@ -129,7 +140,7 @@ static void gemm_bf16_f32out(
             CUBLAS_GEMM_DEFAULT_TENSOR_OP
         ));
     } else {
-        // Batched path: bf16 GEMM + cast (faster cuBLAS kernels)
+        // Large M: bf16 GEMM + cast is faster
         int needed = M * N;
         if (needed > g_gemm_bf16_tmp_size) {
             if (g_gemm_bf16_tmp) cudaFree(g_gemm_bf16_tmp);
@@ -208,6 +219,32 @@ __global__ void f32_to_bf16_kernel(
 
 static void cast_f32_to_bf16(__nv_bfloat16* output, const float* input, int n, cudaStream_t stream = 0) {
     f32_to_bf16_kernel<<<cdiv(n, 256), 256, 0, stream>>>(output, input, n);
+}
+
+// Deinterleave combined SSM projection from bf16 [n_tokens, combined_n] -> 4 separate f32 buffers
+__global__ void deinterleave_ssm_proj_bf16_kernel(
+    float* __restrict__ qkv,      // [n_tokens, conv_channels]
+    float* __restrict__ z,         // [n_tokens, d_inner]
+    float* __restrict__ alpha,     // [n_tokens, dt_rank]
+    float* __restrict__ beta,      // [n_tokens, dt_rank]
+    const __nv_bfloat16* __restrict__ combined,  // [n_tokens, combined_n]
+    int n_tokens, int conv_channels, int d_inner, int dt_rank, int combined_n
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_tokens * combined_n;
+    if (tid >= total) return;
+    int t = tid / combined_n;
+    int c = tid % combined_n;
+    float val = __bfloat162float(combined[tid]);
+    if (c < conv_channels) {
+        qkv[t * conv_channels + c] = val;
+    } else if (c < conv_channels + d_inner) {
+        z[t * d_inner + (c - conv_channels)] = val;
+    } else if (c < conv_channels + d_inner + dt_rank) {
+        alpha[t * dt_rank + (c - conv_channels - d_inner)] = val;
+    } else {
+        beta[t * dt_rank + (c - conv_channels - d_inner - dt_rank)] = val;
+    }
 }
 
 // Deinterleave Q and Gate from packed [n_heads, head_dim*2] -> Q [n_heads, head_dim] + Gate [n_heads, head_dim]
@@ -367,22 +404,20 @@ static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
     launch_sigmoid_mul(model.attn_out, model.attn_out, gate_buf,
         n_tokens * MC::n_head * MC::head_dim, 0);
 
-    // 10. Output projection -> f32 output for residual
-    gemm_bf16_f32out(handle, model.gemm_out, model.attn_out, lw.wo, n_tokens, MC::n_embd, MC::n_head * MC::head_dim);
+    // 10. Output projection -> bf16
+    gemm_bf16(handle, model.attn_out, model.attn_out, lw.wo, n_tokens, MC::n_embd, MC::n_head * MC::head_dim);
 
-    // 11. Fused residual + post-attention norm
-    launch_fused_residual_rmsnorm(model.norm_out, hidden, model.gemm_out,
+    // 11. Fused bf16 cast + residual + post-attention norm (saves cast kernel)
+    launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, model.attn_out,
         lw.post_attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, 0);
 
     // FFN: fused gate+up GEMM, then SwiGLU from packed layout
     gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, n_tokens, 2 * MC::n_ff, MC::n_embd);
     launch_swiglu_packed(model.ffn_buf, model.ffn_buf, n_tokens, MC::n_ff, 0);
 
-    // down_proj -> f32 for residual
-    gemm_bf16_f32out(handle, model.gemm_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
-
-    // FFN residual
-    residual_add_f32(hidden, hidden, model.gemm_out, n_tokens * MC::n_embd);
+    // down_proj -> bf16, then fused bf16 residual add
+    gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
+    launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, 0);
 }
 
 // Forward pass for one SSM (delta-net) layer
@@ -411,67 +446,70 @@ static void forward_ssm_layer(Model& model, int layer_idx, int ssm_idx,
         alpha_f32   = model.gemm_out + MC::ssm_conv_channels + MC::ssm_d_inner;
         beta_raw_f32= model.gemm_out + MC::ssm_conv_channels + MC::ssm_d_inner + MC::ssm_dt_rank;
     } else {
-        // Batched: separate GEMMs into separate buffers
+        // Batched: bf16 combined GEMM + fused deinterleave+cast
+        static constexpr int combined_n = MC::ssm_conv_channels + MC::ssm_d_inner + MC::ssm_dt_rank + MC::ssm_dt_rank;
         qkv_proj = model.ssm_proj_f32;
         z_buf = model.norm_out_f32;
         alpha_f32 = model.gemm_out2;
         beta_raw_f32 = model.gemm_out2 + n_tokens * MC::ssm_dt_rank;
 
-        gemm_bf16_f32out(handle, qkv_proj, model.norm_out, lw.wqkv, n_tokens, MC::ssm_conv_channels, MC::n_embd);
-        gemm_bf16_f32out(handle, z_buf, model.norm_out, lw.wqkv_gate, n_tokens, MC::ssm_d_inner, MC::n_embd);
-        gemm_bf16_f32out(handle, alpha_f32, model.norm_out, lw.ssm_alpha, n_tokens, MC::ssm_dt_rank, MC::n_embd);
-        gemm_bf16_f32out(handle, beta_raw_f32, model.norm_out, lw.ssm_beta, n_tokens, MC::ssm_dt_rank, MC::n_embd);
+        // bf16 GEMM into bf16 temp buffer (reuse ffn_buf which is max_batch * 2*n_ff bf16 — large enough)
+        __nv_bfloat16* combined_bf16 = model.ffn_buf;
+        gemm_bf16(handle, combined_bf16, model.norm_out, lw.w_combined, n_tokens, combined_n, MC::n_embd);
+        // Fused deinterleave + bf16→f32 cast
+        int total = n_tokens * combined_n;
+        deinterleave_ssm_proj_bf16_kernel<<<cdiv(total, 256), 256>>>(
+            qkv_proj, z_buf, alpha_f32, beta_raw_f32,
+            combined_bf16, n_tokens, MC::ssm_conv_channels, MC::ssm_d_inner, MC::ssm_dt_rank, combined_n);
     }
 
-    // 6. Compute gate = softplus(alpha + dt_bias) * ssm_a (all f32, batched)
-    launch_compute_gate(model.ssm_gate_buf, alpha_f32, lw.ssm_dt_bias, lw.ssm_a,
-        n_tokens, MC::ssm_dt_rank, 0);
-
-    // 7. Beta sigmoid (f32 in, f32 out, batched)
-    launch_sigmoid(model.ssm_beta_buf, beta_raw_f32, n_tokens * MC::ssm_dt_rank, 0);
-
-    // 8. Conv1d + SiLU on QKV mixed (f32 in, f32 out, batched)
+    // 6. Conv1d + SiLU on QKV mixed (f32 in, f32 out, batched)
     launch_conv1d_silu(model.ssm_conv_out_buf, qkv_proj, model.ssm_conv_state[ssm_idx],
         lw.ssm_conv1d, n_tokens, MC::ssm_conv_channels, MC::ssm_conv_kernel, 0);
 
     // Update conv state (f32 input)
     launch_update_conv_state(model.ssm_conv_state[ssm_idx], qkv_proj,
         model.ssm_conv_state[ssm_idx], n_tokens, MC::ssm_conv_channels, MC::ssm_conv_kernel, 0);
-
-    // 9-13. Fused SSM step: l2_norm + repeat + delta-net + gated_rmsnorm
-    // Sequential because delta-net state depends on previous token
+    // 7-13. Fused SSM step
     float scale = 1.0f / sqrtf((float)MC::ssm_d_state);
 
-    for (int t = 0; t < n_tokens; t++) {
+    if (n_tokens == 1) {
         launch_fused_ssm_step(
-            model.norm_out + t * MC::ssm_d_inner,       // bf16 output
-            model.ssm_recurrent_state[ssm_idx],          // state IN/OUT
-            model.ssm_conv_out_buf + t * MC::ssm_conv_channels,  // conv_out (Q+K+V)
-            model.ssm_gate_buf + t * MC::ssm_dt_rank,    // gate
-            model.ssm_beta_buf + t * MC::ssm_dt_rank,    // beta
-            z_buf + t * MC::ssm_d_inner,                  // z gate
-            lw.ssm_norm,                                   // norm weight
+            model.norm_out,
+            model.ssm_recurrent_state[ssm_idx],
+            model.ssm_conv_out_buf,
+            alpha_f32, lw.ssm_dt_bias, lw.ssm_a, beta_raw_f32,
+            z_buf, lw.ssm_norm,
             MC::ssm_n_group, MC::ssm_dt_rank,
             MC::ssm_d_state, MC::ssm_head_v_dim,
             scale, MC::rms_norm_eps, MC::rms_norm_eps, 0);
+    } else {
+        launch_fused_ssm_step_batched(
+            model.norm_out,
+            model.ssm_recurrent_state[ssm_idx],
+            model.ssm_conv_out_buf,
+            alpha_f32, lw.ssm_dt_bias, lw.ssm_a, beta_raw_f32,
+            z_buf, lw.ssm_norm, n_tokens,
+            MC::ssm_n_group, MC::ssm_dt_rank,
+            MC::ssm_d_state, MC::ssm_head_v_dim,
+            MC::ssm_conv_channels, MC::ssm_d_inner,
+            scale, MC::rms_norm_eps, MC::rms_norm_eps, 0);
     }
 
-    // 14. Output projection -> f32 for residual (batched)
-    gemm_bf16_f32out(handle, model.gemm_out, model.norm_out, lw.ssm_out, n_tokens, MC::n_embd, MC::ssm_d_inner);
+    // 14. Output projection -> bf16
+    gemm_bf16(handle, model.attn_out, model.norm_out, lw.ssm_out, n_tokens, MC::n_embd, MC::ssm_d_inner);
 
-    // 15. Fused residual + post-attention norm
-    launch_fused_residual_rmsnorm(model.norm_out, hidden, model.gemm_out,
+    // 15. Fused bf16 cast + residual + post-attention norm
+    launch_fused_bf16_residual_rmsnorm(model.norm_out, hidden, model.attn_out,
         lw.post_attn_norm, n_tokens, MC::n_embd, MC::rms_norm_eps, 0);
 
     // FFN: fused gate+up GEMM, then SwiGLU from packed layout
     gemm_bf16(handle, model.ffn_buf, model.norm_out, lw.ffn_gate_up, n_tokens, 2 * MC::n_ff, MC::n_embd);
     launch_swiglu_packed(model.ffn_buf, model.ffn_buf, n_tokens, MC::n_ff, 0);
 
-    // down_proj -> f32 for residual
-    gemm_bf16_f32out(handle, model.gemm_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
-
-    // FFN residual
-    residual_add_f32(hidden, hidden, model.gemm_out, n_tokens * MC::n_embd);
+    // down_proj -> bf16, then fused bf16 residual add
+    gemm_bf16(handle, model.attn_out, model.ffn_buf, lw.ffn_down, n_tokens, MC::n_embd, MC::n_ff);
+    launch_bf16_residual_add(hidden, model.attn_out, n_tokens * MC::n_embd, 0);
 }
 
 // Global temperature (set from command line)
@@ -604,6 +642,15 @@ int main(int argc, char** argv) {
     if (max_batch < 1) max_batch = 1;
     int max_kv_len = (int)prompt_tokens.size() + max_gen_tokens + 16;
     allocate_buffers(model, max_batch, max_kv_len);
+
+    // Warm up cuBLAS (first call allocates workspace)
+    {
+        __nv_bfloat16* dummy_a = model.norm_out;
+        __nv_bfloat16* dummy_b = model.norm_out;
+        __nv_bfloat16* dummy_c = model.attn_out;
+        gemm_bf16(model.cublas_handle, dummy_c, dummy_a, dummy_b, 1, 64, 64);
+        cudaDeviceSynchronize();
+    }
 
     printf("\nGenerating...\n");
 
