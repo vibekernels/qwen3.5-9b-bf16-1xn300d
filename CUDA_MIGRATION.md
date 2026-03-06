@@ -9,7 +9,7 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on b
 | Metric | Our Implementation | llama.cpp | Speedup |
 |--------|-------------------|-----------|---------|
 | Prompt eval (94 tok) | **1835 tok/s** | 563 tok/s | **3.26×** |
-| Generation | **92.2 tok/s** | 77.8 tok/s | **1.19×** |
+| Generation | **92.5 tok/s** | 77.8 tok/s | **1.19×** |
 
 ## Phase 2 Optimizations Applied
 
@@ -44,6 +44,7 @@ Custom CUDA inference engine for Qwen3.5-9B (BF16) that **beats llama.cpp** on b
 - **Single-token SSM step in shared memory**: 64KB state matrix (128x128) loaded into shared memory for decode, matching batched version pattern (43us -> 15us per call, 2.9x faster)
 
 ### Cross-Layer Fusion & Profiling (Phase 5)
+- **Packed Q+Gate+K+V GEMM**: Single GEMM for all attention projections during decode (wq+wkv → wqkv [10240, 4096], saves 8 cuBLAS calls, 137→129 per token)
 - **Cross-layer residual fusion**: FFN down's bf16 residual add fused with next layer's input RMSNorm (saves 32 kernel launches per token)
 - **Fused conv1d+state update**: Combined conv1d_silu + update_conv_state into single kernel for decode (2→1 launch per SSM layer)
 - **Packed decode params**: Single 16-byte memcpy for token_id+position+kv_len (3→1 memcpy)
@@ -62,6 +63,43 @@ Qwen3.5-9B is a **hybrid Mamba-Attention** model (delta-net linear attention):
 - Hidden dim: 4096, FFN dim: 12288, vocab: 248,320
 - Attention: 16 Q heads, 4 KV heads (GQA 4:1), head_dim=256
 - SSM: d_state=128, n_group=16, dt_rank=32, conv_kernel=4
+
+## Decode Profile Breakdown (PROFILE=1, 128 tokens)
+
+| Category | ms/tok | % | Notes |
+|----------|--------|---|-------|
+| FFN gate+up | 4.00 | 34.0% | 32×, N=24576 K=4096, 90% BW |
+| FFN down | 2.30 | 19.5% | 32×, N=4096 K=12288, 78% BW |
+| SSM GEMM | 2.34 | 19.9% | 24× combined+out |
+| LM head | 1.25 | 10.6% | 1×, N=248320 K=4096, 91% BW |
+| Attn GEMM | 0.69 | 5.8% | 8× packed wqkv+wo |
+| SSM step | 0.40 | 3.4% | 24× fused SSM (shared mem) |
+| Norms | 0.33 | 2.8% | Fused residual+norm |
+| Attn kernels | 0.27 | 2.3% | rope, deinterleave, kv_append, attention_decode |
+| FFN kernels | 0.11 | 0.9% | swiglu |
+| SSM conv | 0.09 | 0.7% | Fused conv1d+update |
+| **GEMM total** | **10.58** | **89.8%** | 13.7GB/tok, ~79% of 1792 GB/s |
+
+## Bandwidth Analysis
+
+- **Total weight bytes**: 13.7 GB/token (BF16)
+- **Theoretical minimum**: 13.7 GB / 1792 GB/s = 7.65 ms/tok (131 tok/s)
+- **Actual (graph mode)**: ~10.8 ms/tok (92.5 tok/s) = **79% bandwidth utilization**
+- **Gap breakdown**: cuBLAS per-GEMV fixed latency (~3-5µs × 129 calls), non-GEMM compute (1.3ms), DRAM access pattern overhead
+
+### cuBLAS Overhead Investigation
+
+Benchmarked persistent GEMV kernel (cooperative groups + grid sync) and custom vectorized GEMV vs cuBLAS:
+
+| Approach | Cold L2 (realistic) | Warm L2 | Notes |
+|----------|-------------------|---------|-------|
+| cuBLAS GemmEx | 71.8 µs | 69.4 µs | Tensor cores, hand-tuned SASS |
+| Custom GEMV (vectorized 128-bit) | 71.7 µs | 20.5 µs | 3.4× faster on warm L2, equal on cold |
+| Persistent GEMV (grid sync) | — | ~same | 2.4 µs/sync × 129 = 0.31ms overhead |
+
+**Key finding**: The "per-kernel overhead" is not cuBLAS dispatch cost — it's fundamental DRAM access latency for cold cache lines. Custom kernels perform identically to cuBLAS when L2 is cold (the realistic scenario). The ~21% gap from theoretical peak BW is inherent to the memory access pattern, not the kernel implementation.
+
+**Replacing cuBLAS**: Technically feasible (custom GEMV matches cuBLAS for cold L2), but would not improve inference speed. Benefits would be: eliminating ~150MB library dependency, enabling GEMV+post-op fusion, reducing binary size.
 
 ## Build & Run
 
