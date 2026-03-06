@@ -78,97 +78,86 @@ void launch_fused_ssm_step_batched(__nv_bfloat16* output, float* state,
 
 using MC = ModelConfig;
 
-// Custom GEMV: y[N] = W[N,K] @ x[K], bf16 weights × bf16 input → bf16 output
-// Each warp processes 4 output rows simultaneously, reusing x from L1/L2 cache.
-// 8 warps/block = 32 rows/block.
-__global__ void custom_gemv_bf16_kernel(
-    __nv_bfloat16* __restrict__ y,
+// Vectorized GEMV: y[N] = W[N,K] @ x[K], bf16 weights × bf16 input → bf16/f32 output
+// Uses shared memory for x vector, 128-bit vectorized loads for weights.
+// Each warp processes one row. 8 warps/block = 8 rows/block.
+// Requires K divisible by 8 (true for all our GEMM sizes).
+template<bool F32_OUTPUT>
+__global__ void fast_gemv_kernel(
+    void* __restrict__ y,
     const __nv_bfloat16* __restrict__ W,  // [N, K] row-major
     const __nv_bfloat16* __restrict__ x,  // [K]
     int N, int K
 ) {
-    const int warp_id = threadIdx.x / 32;
-    const int lane_id = threadIdx.x % 32;
-    const int base_row = blockIdx.x * 32 + warp_id * 4;
+    extern __shared__ __nv_bfloat16 sx[];  // [K] in shared memory
 
-    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
-    bool r0 = base_row < N, r1 = base_row+1 < N, r2 = base_row+2 < N, r3 = base_row+3 < N;
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+    const int row = blockIdx.x * 8 + warp_id;  // 8 warps = 8 rows per block
 
-    for (int k = lane_id; k < K; k += 32) {
-        float xv = __bfloat162float(x[k]);
-        if (r0) sum0 += __bfloat162float(W[(int64_t)(base_row)*K + k]) * xv;
-        if (r1) sum1 += __bfloat162float(W[(int64_t)(base_row+1)*K + k]) * xv;
-        if (r2) sum2 += __bfloat162float(W[(int64_t)(base_row+2)*K + k]) * xv;
-        if (r3) sum3 += __bfloat162float(W[(int64_t)(base_row+3)*K + k]) * xv;
+    // Cooperatively load x into shared memory using 128-bit loads
+    const int K8 = K / 8;  // number of uint4 chunks
+    uint4* sx_v = reinterpret_cast<uint4*>(sx);
+    const uint4* x_v = reinterpret_cast<const uint4*>(x);
+    for (int i = tid; i < K8; i += 256) {
+        sx_v[i] = x_v[i];
+    }
+    __syncthreads();
+
+    if (row >= N) return;
+
+    // Vectorized dot product: each thread handles K8/32 chunks (128-bit each)
+    const uint4* W_v = reinterpret_cast<const uint4*>(&W[(int64_t)row * K]);
+    float acc = 0.0f;
+
+    for (int i = lane_id; i < K8; i += 32) {
+        uint4 wc = W_v[i];
+        uint4 xc = sx_v[i];
+        const __nv_bfloat16* wb = reinterpret_cast<const __nv_bfloat16*>(&wc);
+        const __nv_bfloat16* xb = reinterpret_cast<const __nv_bfloat16*>(&xc);
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            acc += __bfloat162float(wb[j]) * __bfloat162float(xb[j]);
+        }
     }
 
-    // Warp reduction for all 4 sums
+    // Warp reduction
     for (int offset = 16; offset > 0; offset >>= 1) {
-        sum0 += __shfl_down_sync(0xffffffff, sum0, offset);
-        sum1 += __shfl_down_sync(0xffffffff, sum1, offset);
-        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
-        sum3 += __shfl_down_sync(0xffffffff, sum3, offset);
+        acc += __shfl_down_sync(0xffffffff, acc, offset);
     }
 
     if (lane_id == 0) {
-        if (r0) y[base_row]   = __float2bfloat16(sum0);
-        if (r1) y[base_row+1] = __float2bfloat16(sum1);
-        if (r2) y[base_row+2] = __float2bfloat16(sum2);
-        if (r3) y[base_row+3] = __float2bfloat16(sum3);
-    }
-}
-
-// Custom GEMV with f32 output
-__global__ void custom_gemv_bf16_f32out_kernel(
-    float* __restrict__ y,
-    const __nv_bfloat16* __restrict__ W,
-    const __nv_bfloat16* __restrict__ x,
-    int N, int K
-) {
-    const int warp_id = threadIdx.x / 32;
-    const int lane_id = threadIdx.x % 32;
-    const int base_row = blockIdx.x * 32 + warp_id * 4;
-
-    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
-    bool r0 = base_row < N, r1 = base_row+1 < N, r2 = base_row+2 < N, r3 = base_row+3 < N;
-
-    for (int k = lane_id; k < K; k += 32) {
-        float xv = __bfloat162float(x[k]);
-        if (r0) sum0 += __bfloat162float(W[(int64_t)(base_row)*K + k]) * xv;
-        if (r1) sum1 += __bfloat162float(W[(int64_t)(base_row+1)*K + k]) * xv;
-        if (r2) sum2 += __bfloat162float(W[(int64_t)(base_row+2)*K + k]) * xv;
-        if (r3) sum3 += __bfloat162float(W[(int64_t)(base_row+3)*K + k]) * xv;
-    }
-
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        sum0 += __shfl_down_sync(0xffffffff, sum0, offset);
-        sum1 += __shfl_down_sync(0xffffffff, sum1, offset);
-        sum2 += __shfl_down_sync(0xffffffff, sum2, offset);
-        sum3 += __shfl_down_sync(0xffffffff, sum3, offset);
-    }
-
-    if (lane_id == 0) {
-        if (r0) y[base_row]   = sum0;
-        if (r1) y[base_row+1] = sum1;
-        if (r2) y[base_row+2] = sum2;
-        if (r3) y[base_row+3] = sum3;
+        if constexpr (F32_OUTPUT) {
+            reinterpret_cast<float*>(y)[row] = acc;
+        } else {
+            reinterpret_cast<__nv_bfloat16*>(y)[row] = __float2bfloat16(acc);
+        }
     }
 }
 
 static void launch_gemv_bf16(__nv_bfloat16* y, const __nv_bfloat16* W, const __nv_bfloat16* x,
     int N, int K, cudaStream_t stream) {
-    int blocks = cdiv(N, 32);
-    custom_gemv_bf16_kernel<<<blocks, 256, 0, stream>>>(y, W, x, N, K);
+    int blocks = cdiv(N, 8);
+    size_t smem = K * sizeof(__nv_bfloat16);
+    fast_gemv_kernel<false><<<blocks, 256, smem, stream>>>(y, W, x, N, K);
 }
 
 static void launch_gemv_bf16_f32out(float* y, const __nv_bfloat16* W, const __nv_bfloat16* x,
     int N, int K, cudaStream_t stream) {
-    int blocks = cdiv(N, 32);
-    custom_gemv_bf16_f32out_kernel<<<blocks, 256, 0, stream>>>(y, W, x, N, K);
+    int blocks = cdiv(N, 8);
+    size_t smem = K * sizeof(__nv_bfloat16);
+    fast_gemv_kernel<true><<<blocks, 256, smem, stream>>>(y, W, x, N, K);
 }
 
 // Flag to enable/disable custom GEMV (set via env var CUSTOM_GEMV=1)
 static bool g_use_custom_gemv = false;
+
+// Pre-allocated decode buffers (avoid per-token cudaMalloc)
+// Packed as [token_id, position, kv_len, kv_len+1] for single memcpy
+static int* g_decode_params_d = nullptr;
+static int* g_token_d = nullptr;   // points to g_decode_params_d[0]
+static int* g_pos_d = nullptr;     // points to g_decode_params_d[1]
 
 // cuBLAS GEMM wrapper: C = A @ B^T  (row-major), bf16 output
 // A: [M, K] bf16, B: [N, K] bf16, C: [M, N] bf16
@@ -422,8 +411,11 @@ static void allocate_buffers(Model& model, int max_batch, int max_kv_len) {
     }
 
     // CUDA graph support
-    // d_kv_len[0] = kv_pos (for kv_cache_append), d_kv_len[1] = total_kv_len (for attention_decode)
-    model.d_kv_len = cuda_alloc<int>(2);
+    // Packed decode params: [token_id, position, kv_len, kv_len+1] — single memcpy per decode
+    g_decode_params_d = cuda_alloc<int>(4);
+    g_token_d = g_decode_params_d;
+    g_pos_d = g_decode_params_d + 1;
+    model.d_kv_len = g_decode_params_d + 2;
     CUDA_CHECK(cudaStreamCreate(&model.compute_stream));
     cublasSetStream(model.cublas_handle, model.compute_stream);
     g_compute_stream = model.compute_stream;
@@ -649,13 +641,8 @@ __global__ void embedding_to_f32_kernel(
     }
 }
 
-// Pre-allocated decode buffers (avoid per-token cudaMalloc)
-static int* g_token_d = nullptr;
-static int* g_pos_d = nullptr;
-
 static void ensure_decode_bufs() {
-    if (!g_token_d) g_token_d = cuda_alloc<int>(1);
-    if (!g_pos_d) g_pos_d = cuda_alloc<int>(1);
+    // g_decode_params_d is allocated during model init
 }
 
 // Execute decode forward pass body (embedding through LM head)
@@ -690,11 +677,9 @@ static int forward_decode(Model& model, int token_id, int position) {
     ensure_decode_bufs();
     cudaStream_t s = model.compute_stream;
 
-    // Upload variable parameters (before graph launch, on same stream for ordering)
-    int kv_params[2] = { model.kv_len, model.kv_len + 1 };
-    CUDA_CHECK(cudaMemcpyAsync(g_token_d, &token_id, sizeof(int), cudaMemcpyHostToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(g_pos_d, &position, sizeof(int), cudaMemcpyHostToDevice, s));
-    CUDA_CHECK(cudaMemcpyAsync(model.d_kv_len, kv_params, 2 * sizeof(int), cudaMemcpyHostToDevice, s));
+    // Upload all decode parameters in a single memcpy (token_id, position, kv_len, kv_len+1)
+    int decode_params[4] = { token_id, position, model.kv_len, model.kv_len + 1 };
+    CUDA_CHECK(cudaMemcpyAsync(g_decode_params_d, decode_params, 4 * sizeof(int), cudaMemcpyHostToDevice, s));
 
     if (getenv("NO_GRAPH")) {
         forward_decode_body(model);
