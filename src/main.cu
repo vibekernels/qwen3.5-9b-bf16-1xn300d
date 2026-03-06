@@ -511,12 +511,12 @@ static void forward_attention_layer(Model& model, int layer_idx, int attn_idx,
         k_proj = model.qkv_buf + q_gate_dim;
         v_proj = model.qkv_buf + q_gate_dim + kv_dim;
     } else {
-        // Batched: separate GEMMs for Q and K/V
-        gemm_bf16(model.qkv_buf, model.norm_out, lw.wq, n_tokens, q_gate_dim, MC::n_embd);
+        // Batched: separate GEMMs for Q and K/V (sliced from packed wqkv)
+        gemm_bf16(model.qkv_buf, model.norm_out, lw.wqkv, n_tokens, q_gate_dim, MC::n_embd);
         k_proj = model.attn_out;
-        gemm_bf16(k_proj, model.norm_out, lw.wk, n_tokens, kv_dim, MC::n_embd);
+        gemm_bf16(k_proj, model.norm_out, lw.wqkv + (size_t)q_gate_dim * MC::n_embd, n_tokens, kv_dim, MC::n_embd);
         v_proj = model.ffn_buf2;
-        gemm_bf16(v_proj, model.norm_out, lw.wv, n_tokens, kv_dim, MC::n_embd);
+        gemm_bf16(v_proj, model.norm_out, lw.wqkv + (size_t)(q_gate_dim + kv_dim) * MC::n_embd, n_tokens, kv_dim, MC::n_embd);
     }
 
     // 5. Deinterleave Q and Gate with a single kernel
@@ -967,7 +967,9 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     }
 
     g_max_ctx = max_ctx;
-    allocate_buffers(g_model, max_ctx, max_ctx);
+    int prefill_batch = 4096;  // chunk size for prefill — keeps working buffers small
+    if (prefill_batch > max_ctx) prefill_batch = max_ctx;
+    allocate_buffers(g_model, prefill_batch, max_ctx);
 
     // Warm up GPU kernels
     {
@@ -1047,34 +1049,45 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
 
     int next_token = -1;
 
-    // Prefill
+    // Prefill (chunked to fit working buffers)
     {
         cudaStream_t s = g_model.compute_stream;
+        int max_batch = g_model.max_tokens;
+        int alloc_size = (n_prompt < max_batch) ? n_prompt : max_batch;
 
-        int* tokens_d = cuda_alloc<int>(n_prompt);
-        int* pos_d = cuda_alloc<int>(n_prompt);
-        cuda_upload(tokens_d, prompt_tokens.data(), n_prompt);
-        std::vector<int> positions(n_prompt);
-        for (int i = 0; i < n_prompt; i++) positions[i] = g_model.kv_len + i;
-        cuda_upload(pos_d, positions.data(), n_prompt);
+        int* tokens_d = cuda_alloc<int>(alloc_size);
+        int* pos_d = cuda_alloc<int>(alloc_size);
+        std::vector<int> positions(alloc_size);
 
-        int kv_params[2] = { g_model.kv_len, g_model.kv_len + n_prompt };
-        cuda_upload(g_model.d_kv_len, kv_params, 2);
+        int processed = 0;
+        int last_chunk = 0;
+        while (processed < n_prompt) {
+            last_chunk = n_prompt - processed;
+            if (last_chunk > max_batch) last_chunk = max_batch;
 
-        embedding_to_f32_kernel<<<n_prompt, 1024, 0, s>>>(
-            g_model.hidden_state, g_model.tok_embd, tokens_d, MC::n_embd);
+            cuda_upload(tokens_d, prompt_tokens.data() + processed, last_chunk);
+            for (int i = 0; i < last_chunk; i++) positions[i] = g_model.kv_len + i;
+            cuda_upload(pos_d, positions.data(), last_chunk);
 
-        for (int il = 0; il < MC::n_layers; il++) {
-            if (MC::is_recurrent(il)) {
-                forward_ssm_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, n_prompt);
-            } else {
-                forward_attention_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, n_prompt, pos_d);
+            int kv_params[2] = { g_model.kv_len, g_model.kv_len + last_chunk };
+            cuda_upload(g_model.d_kv_len, kv_params, 2);
+
+            embedding_to_f32_kernel<<<last_chunk, 1024, 0, s>>>(
+                g_model.hidden_state, g_model.tok_embd, tokens_d, MC::n_embd);
+
+            for (int il = 0; il < MC::n_layers; il++) {
+                if (MC::is_recurrent(il)) {
+                    forward_ssm_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, last_chunk);
+                } else {
+                    forward_attention_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, last_chunk, pos_d);
+                }
             }
+
+            g_model.kv_len += last_chunk;
+            processed += last_chunk;
         }
 
-        g_model.kv_len += n_prompt;
-
-        float* last_hidden = g_model.hidden_state + (n_prompt - 1) * MC::n_embd;
+        float* last_hidden = g_model.hidden_state + (last_chunk - 1) * MC::n_embd;
         launch_rmsnorm_f32in(g_model.norm_out, last_hidden, g_model.output_norm,
             1, MC::n_embd, MC::rms_norm_eps, s);
         gemm_bf16_f32out(g_model.logits_f32, g_model.norm_out, g_model.output,

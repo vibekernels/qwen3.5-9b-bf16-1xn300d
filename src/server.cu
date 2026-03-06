@@ -357,7 +357,7 @@ int main(int argc, char** argv) {
     std::string model_path;
     std::string host = "0.0.0.0";
     int port = 8080;
-    int ctx_size = 4096;
+    int ctx_size = 262144;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {

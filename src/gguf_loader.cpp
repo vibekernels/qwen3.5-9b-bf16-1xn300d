@@ -383,6 +383,29 @@ bool load_model(const std::string& path, Model& model) {
         }
     }
 
+    // Free original unpacked weights (only packed versions are used in forward passes)
+    for (int il = 0; il < ModelConfig::n_layers; il++) {
+        if (ModelConfig::is_recurrent(il)) {
+            int si = model.layer_subidx[il];
+            auto& lw = model.ssm_layers[si];
+            cudaFree(lw.wqkv);      lw.wqkv = nullptr;
+            cudaFree(lw.wqkv_gate); lw.wqkv_gate = nullptr;
+            cudaFree(lw.ssm_alpha);  lw.ssm_alpha = nullptr;
+            cudaFree(lw.ssm_beta);   lw.ssm_beta = nullptr;
+            cudaFree(lw.ffn_gate);   lw.ffn_gate = nullptr;
+            cudaFree(lw.ffn_up);     lw.ffn_up = nullptr;
+        } else {
+            int ai = model.layer_subidx[il];
+            auto& lw = model.attn_layers[ai];
+            cudaFree(lw.wq);  lw.wq = nullptr;
+            cudaFree(lw.wk);  lw.wk = nullptr;
+            cudaFree(lw.wv);  lw.wv = nullptr;
+            cudaFree(lw.wkv); lw.wkv = nullptr;
+            cudaFree(lw.ffn_gate); lw.ffn_gate = nullptr;
+            cudaFree(lw.ffn_up);   lw.ffn_up = nullptr;
+        }
+    }
+
     printf("Model loaded successfully.\n");
 
     return true;
