@@ -41,7 +41,12 @@ static std::string apply_chat_template(const json& messages) {
     for (const auto& msg : messages) {
         std::string role = msg.value("role", "user");
         std::string content = msg.value("content", "");
-        prompt += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+        if (role == "assistant") {
+            // Match the generation format so prompt cache can reuse prior turns
+            prompt += "<|im_start|>assistant\n<think>\n\n</think>\n\n" + content + "<|im_end|>\n";
+        } else {
+            prompt += "<|im_start|>" + role + "\n" + content + "<|im_end|>\n";
+        }
     }
     // Add generation prompt with thinking disabled
     prompt += "<|im_start|>assistant\n<think>\n\n</think>\n\n";
@@ -106,7 +111,6 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
 
                 {
                     std::lock_guard<std::mutex> lock(g_inference_mutex);
-                    reset_state();
                     generate(prompt_tokens, max_tokens, temperature,
                         [&](int token_id, const std::string& text) -> bool {
                             json chunk = {
@@ -153,7 +157,6 @@ static void handle_chat_completions(const httplib::Request& req, httplib::Respon
 
         {
             std::lock_guard<std::mutex> lock(g_inference_mutex);
-            reset_state();
             total_tokens = generate(prompt_tokens, max_tokens, temperature,
                 [&](int token_id, const std::string& text) -> bool {
                     full_response += text;

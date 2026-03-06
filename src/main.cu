@@ -20,6 +20,7 @@ static Model g_model;
 static Tokenizer g_tokenizer;
 static bool g_loaded = false;
 static int g_max_ctx = 0;
+static std::vector<int> g_cached_tokens;  // tokens already in KV/SSM state
 
 // Forward declarations for kernel launchers
 // (embedding_to_f32 is defined inline in this file)
@@ -1003,6 +1004,7 @@ void reset_state() {
     }
 
     g_model.kv_len = 0;
+    g_cached_tokens.clear();
 
     // Invalidate CUDA graph
     if (g_model.decode_graph_captured) {
@@ -1035,11 +1037,27 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
         n_prompt = max_kv - 1;  // leave room for at least 1 generated token
     }
 
+    // Prompt caching: find common prefix with previous request's state
+    int prefix_len = 0;
+    {
+        int max_prefix = std::min(n_prompt, (int)g_cached_tokens.size());
+        while (prefix_len < max_prefix && prompt_tokens[prefix_len] == g_cached_tokens[prefix_len]) {
+            prefix_len++;
+        }
+        if (prefix_len < (int)g_cached_tokens.size()) {
+            // Prefix diverged — cached state is invalid, full reset needed
+            reset_state();
+            prefix_len = 0;
+        }
+    }
+
+    int n_new = n_prompt - prefix_len;  // tokens to actually prefill
+
     // Clamp max_tokens so we don't exceed context during decode
-    int remaining = max_kv - (g_model.kv_len + n_prompt);
+    int remaining = max_kv - (g_model.kv_len + n_new);
     if (remaining < 1) {
-        fprintf(stderr, "Context full (kv_len=%d + prompt=%d >= %d). Cannot generate.\n",
-                g_model.kv_len, n_prompt, max_kv);
+        fprintf(stderr, "Context full (kv_len=%d + new=%d >= %d). Cannot generate.\n",
+                g_model.kv_len, n_new, max_kv);
         if (stop_reason) *stop_reason = STOP_LENGTH;
         return 0;
     }
@@ -1047,58 +1065,76 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
         max_tokens = remaining;
     }
 
+    if (prefix_len > 0) {
+        fprintf(stderr, "Prompt cache: reusing %d tokens, prefilling %d new\n", prefix_len, n_new);
+    }
+
     int next_token = -1;
 
-    // Prefill (chunked to fit working buffers)
+    // Prefill new tokens (chunked to fit working buffers)
     {
         cudaStream_t s = g_model.compute_stream;
         int max_batch = g_model.max_tokens;
-        int alloc_size = (n_prompt < max_batch) ? n_prompt : max_batch;
 
-        int* tokens_d = cuda_alloc<int>(alloc_size);
-        int* pos_d = cuda_alloc<int>(alloc_size);
-        std::vector<int> positions(alloc_size);
+        if (n_new > 0) {
+            int alloc_size = (n_new < max_batch) ? n_new : max_batch;
 
-        int processed = 0;
-        int last_chunk = 0;
-        while (processed < n_prompt) {
-            last_chunk = n_prompt - processed;
-            if (last_chunk > max_batch) last_chunk = max_batch;
+            int* tokens_d = cuda_alloc<int>(alloc_size);
+            int* pos_d = cuda_alloc<int>(alloc_size);
+            std::vector<int> positions(alloc_size);
 
-            cuda_upload(tokens_d, prompt_tokens.data() + processed, last_chunk);
-            for (int i = 0; i < last_chunk; i++) positions[i] = g_model.kv_len + i;
-            cuda_upload(pos_d, positions.data(), last_chunk);
+            int processed = 0;
+            int last_chunk = 0;
+            while (processed < n_new) {
+                last_chunk = n_new - processed;
+                if (last_chunk > max_batch) last_chunk = max_batch;
 
-            int kv_params[2] = { g_model.kv_len, g_model.kv_len + last_chunk };
-            cuda_upload(g_model.d_kv_len, kv_params, 2);
+                cuda_upload(tokens_d, prompt_tokens.data() + prefix_len + processed, last_chunk);
+                for (int i = 0; i < last_chunk; i++) positions[i] = g_model.kv_len + i;
+                cuda_upload(pos_d, positions.data(), last_chunk);
 
-            embedding_to_f32_kernel<<<last_chunk, 1024, 0, s>>>(
-                g_model.hidden_state, g_model.tok_embd, tokens_d, MC::n_embd);
+                int kv_params[2] = { g_model.kv_len, g_model.kv_len + last_chunk };
+                cuda_upload(g_model.d_kv_len, kv_params, 2);
 
-            for (int il = 0; il < MC::n_layers; il++) {
-                if (MC::is_recurrent(il)) {
-                    forward_ssm_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, last_chunk);
-                } else {
-                    forward_attention_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, last_chunk, pos_d);
+                embedding_to_f32_kernel<<<last_chunk, 1024, 0, s>>>(
+                    g_model.hidden_state, g_model.tok_embd, tokens_d, MC::n_embd);
+
+                for (int il = 0; il < MC::n_layers; il++) {
+                    if (MC::is_recurrent(il)) {
+                        forward_ssm_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, last_chunk);
+                    } else {
+                        forward_attention_layer(g_model, il, g_model.layer_subidx[il], g_model.hidden_state, last_chunk, pos_d);
+                    }
                 }
+
+                g_model.kv_len += last_chunk;
+                processed += last_chunk;
             }
 
-            g_model.kv_len += last_chunk;
-            processed += last_chunk;
+            float* last_hidden = g_model.hidden_state + (last_chunk - 1) * MC::n_embd;
+            launch_rmsnorm_f32in(g_model.norm_out, last_hidden, g_model.output_norm,
+                1, MC::n_embd, MC::rms_norm_eps, s);
+            gemm_bf16_f32out(g_model.logits_f32, g_model.norm_out, g_model.output,
+                1, MC::n_vocab, MC::n_embd);
+
+            CUDA_CHECK(cudaStreamSynchronize(s));
+            next_token = sample_token(g_model.logits_f32, MC::n_vocab, g_temperature);
+
+            cudaFree(tokens_d);
+            cudaFree(pos_d);
+        } else {
+            // All prompt tokens cached — re-derive first token from last cached position
+            // Process last prompt token through decode to get logits
+            int last_tok = prompt_tokens[n_prompt - 1];
+            // kv_len already covers this token, so we need to recompute logits only
+            // Back up kv_len by 1, run one decode step to regenerate logits
+            g_model.kv_len--;
+            next_token = forward_decode(g_model, last_tok, g_model.kv_len);
         }
-
-        float* last_hidden = g_model.hidden_state + (last_chunk - 1) * MC::n_embd;
-        launch_rmsnorm_f32in(g_model.norm_out, last_hidden, g_model.output_norm,
-            1, MC::n_embd, MC::rms_norm_eps, s);
-        gemm_bf16_f32out(g_model.logits_f32, g_model.norm_out, g_model.output,
-            1, MC::n_vocab, MC::n_embd);
-
-        CUDA_CHECK(cudaStreamSynchronize(s));
-        next_token = sample_token(g_model.logits_f32, MC::n_vocab, g_temperature);
-
-        cudaFree(tokens_d);
-        cudaFree(pos_d);
     }
+
+    // Update cached token sequence (prompt portion)
+    g_cached_tokens.assign(prompt_tokens.begin(), prompt_tokens.begin() + n_prompt);
 
     // Decode loop
     int generated = 0;
@@ -1111,6 +1147,7 @@ int generate(const std::vector<int>& prompt_tokens, int max_tokens,
 
         std::string tok_str = g_tokenizer.decode(next_token);
         generated++;
+        g_cached_tokens.push_back(next_token);
 
         if (cb && !cb(next_token, tok_str)) {
             reason = STOP_CALLBACK;
