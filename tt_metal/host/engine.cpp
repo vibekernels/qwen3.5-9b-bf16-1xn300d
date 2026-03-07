@@ -49,8 +49,8 @@ using MC = ModelConfig;
 // ============================================================================
 // Global state
 // ============================================================================
-static std::shared_ptr<MeshDevice> g_mesh;   // chip 0: layer weights
-static std::shared_ptr<MeshDevice> g_mesh2;  // chip 1: wo, ssm_out, LM head
+static std::shared_ptr<MeshDevice> g_mesh;   // chip 0: layer weights + output projections (BFP8)
+static std::shared_ptr<MeshDevice> g_mesh2;  // chip 1: LM head only
 static ModelBuffers g_model;
 static Tokenizer g_tokenizer;
 static bool g_loaded = false;
@@ -89,9 +89,9 @@ struct WeightTensors {
     Tensor ssm_ffn_gate_up[24];
     Tensor ssm_ffn_down[24];
 
-    // Chip 1: Output projections + LM head
-    Tensor attn_wo[8];           // [n_embd, n_head*head_dim] on chip 1
-    Tensor ssm_out[24];          // [n_embd, ssm_d_inner] on chip 1
+    // Output projections (chip 0, BFP8) + LM head (chip 1, BFP8)
+    Tensor attn_wo[8];           // [n_embd, n_head*head_dim] on chip 0
+    Tensor ssm_out[24];          // [n_embd, ssm_d_inner] on chip 0
     Tensor lm_head;              // [n_vocab, n_embd] on chip 1
 
     // Norm weights as device tensors (for on-device RMSNorm)
@@ -362,17 +362,26 @@ static void norm_matmul_ops(const Tensor& norm_weight, const Tensor& weight,
                  std::nullopt, std::nullopt, gb.out_tensor);
 }
 
-// Run residual add + norm + FFN chain + residual add on device
-// Hidden state stays on device throughout — no PCIe needed.
-static void ffn_chain_ops(const Tensor& norm_weight,
-                          const Tensor& gate_up_weight, const Tensor& down_weight) {
-    // 1. Residual add: hidden += layer_out (stored in g_residual_dev)
-    ttnn::add_(g_hidden_dev, g_residual_dev);
+// Run outproj matmul + residual add + norm + FFN chain + residual add on device.
+// Input: g_residual_dev contains ssm_proj_in or attn_out (written by host).
+// Output: g_hidden_dev updated with outproj residual + FFN residual.
+static void outproj_ffn_chain_ops(const Tensor& outproj_weight, uint32_t outproj_M, uint32_t outproj_K,
+                                   const Tensor& norm_weight,
+                                   const Tensor& gate_up_weight, const Tensor& down_weight) {
+    // 1. Output projection: matmul(residual, outproj_weight)
+    auto& gb_op = get_gemv_buf(g_mesh.get(), outproj_M, outproj_K);
+    ttnn::matmul(g_residual_dev, outproj_weight,
+                 false, true, ttnn::DRAM_MEMORY_CONFIG,
+                 std::nullopt, std::nullopt, std::nullopt, std::nullopt,
+                 std::nullopt, std::nullopt, gb_op.out_tensor);
 
-    // 2. RMSNorm
+    // 2. Residual add: hidden += outproj result
+    ttnn::add_(g_hidden_dev, gb_op.out_tensor);
+
+    // 3. RMSNorm
     auto norm_out = ttnn::rms_norm(g_hidden_dev, MC::rms_norm_eps, norm_weight);
 
-    // 3. FFN: gate_up matmul → slice → silu → multiply → down matmul
+    // 4. FFN: gate_up matmul → slice → silu → multiply → down matmul
     auto& gb_gu = get_gemv_buf(g_mesh.get(), 2 * MC::n_ff, MC::n_embd);
     auto& gb_dn = get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_ff);
     auto& fb = get_ffn_buf(g_mesh.get());
@@ -402,7 +411,7 @@ static void ffn_chain_ops(const Tensor& norm_weight,
                  std::nullopt, std::nullopt, std::nullopt, std::nullopt,
                  std::nullopt, std::nullopt, gb_dn.out_tensor);
 
-    // 4. Residual add: hidden += ffn_out
+    // 5. Residual add: hidden += ffn_out
     ttnn::add_(g_hidden_dev, gb_dn.out_tensor);
 }
 
@@ -601,17 +610,17 @@ static void create_weight_tensors() {
     printf("Converted %d attention + %d SSM weight tensors to BFLOAT8_B on chip 0.\n",
            attn_idx, ssm_idx);
 
-    // Chip 1: wo, ssm_out, LM head (uploaded from host bf16 as BFLOAT8_B)
-    printf("Uploading output projections to chip 1 as BFLOAT8_B...\n");
+    // All output projections + LM head now on chip 0 too (BFP8 fits!)
+    printf("Uploading output projections + LM head to chip 0 as BFLOAT8_B...\n");
     for (int i = 0; i < 8; i++) {
         auto& lw = g_model.attn_layers[i];
-        g_wt.attn_wo[i] = upload_bf16_weight(g_mesh2.get(), lw.wo_host.data(),
+        g_wt.attn_wo[i] = upload_bf16_weight(g_mesh.get(), lw.wo_host.data(),
                                               MC::n_embd, MC::n_head * MC::head_dim);
         printf("  wo[%d] uploaded\n", i);
     }
     for (int i = 0; i < 24; i++) {
         auto& lw = g_model.ssm_layers[i];
-        g_wt.ssm_out[i] = upload_bf16_weight(g_mesh2.get(), lw.ssm_out_host.data(),
+        g_wt.ssm_out[i] = upload_bf16_weight(g_mesh.get(), lw.ssm_out_host.data(),
                                               MC::n_embd, MC::ssm_d_inner);
         printf("  ssm_out[%d] uploaded\n", i);
     }
@@ -926,28 +935,21 @@ static float* forward_decode() {
 
             g_time_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host0).count();
 
-            // 6. Output projection on chip 1
-            auto t1 = Clock::now();
-            float* layer_out = g_layer_out.data();
-            device_gemv(g_mesh2.get(), g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
-                       ssm_proj_in, layer_out, 24 + ssm_idx);
-            g_time_outproj += std::chrono::duration<double, std::milli>(Clock::now() - t1).count();
-
-            // 7. Write layer_out to g_residual_dev, then residual+norm+FFN+residual ON DEVICE
+            // 6. Write ssm_proj_in to g_residual_dev, then outproj+FFN chain ON DEVICE
             auto t_rw = Clock::now();
-            write_f32_to_buf(g_residual_dev_buf, layer_out, MC::n_embd);
+            write_f32_to_buf(g_residual_dev_buf, ssm_proj_in, MC::ssm_d_inner);
             g_time_reswrite += std::chrono::duration<double, std::milli>(Clock::now() - t_rw).count();
 
             auto t2 = Clock::now();
             if (!g_ffn_chain_traces_valid[layer]) {
-                // Warmup
-                ffn_chain_ops(g_wt.post_norm[layer],
-                             g_wt.ssm_ffn_gate_up[ssm_idx], g_wt.ssm_ffn_down[ssm_idx]);
+                outproj_ffn_chain_ops(g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                      g_wt.post_norm[layer],
+                                      g_wt.ssm_ffn_gate_up[ssm_idx], g_wt.ssm_ffn_down[ssm_idx]);
                 Finish(cq0);
-                // Capture trace
                 auto tid = ttnn::operations::trace::begin_trace_capture(g_mesh.get(), std::nullopt);
-                ffn_chain_ops(g_wt.post_norm[layer],
-                             g_wt.ssm_ffn_gate_up[ssm_idx], g_wt.ssm_ffn_down[ssm_idx]);
+                outproj_ffn_chain_ops(g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                      g_wt.post_norm[layer],
+                                      g_wt.ssm_ffn_gate_up[ssm_idx], g_wt.ssm_ffn_down[ssm_idx]);
                 ttnn::operations::trace::end_trace_capture(g_mesh.get(), tid, std::nullopt);
                 g_ffn_chain_traces[layer] = tid;
                 g_ffn_chain_traces_valid[layer] = true;
@@ -1067,26 +1069,21 @@ static float* forward_decode() {
                 attn_out[i] *= 1.0f / (1.0f + expf(-gate_heads[i]));
             g_time_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host1).count();
 
-            // 8. Output projection on chip 1
-            auto t1 = Clock::now();
-            float* layer_out = g_layer_out.data();
-            device_gemv(g_mesh2.get(), g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
-                       attn_out, layer_out, 56 + attn_idx);
-            g_time_outproj += std::chrono::duration<double, std::milli>(Clock::now() - t1).count();
-
-            // 9. Write layer_out to g_residual_dev, then residual+norm+FFN+residual ON DEVICE
+            // 8. Write attn_out to g_residual_dev, then outproj+FFN chain ON DEVICE
             auto t_rw2 = Clock::now();
-            write_f32_to_buf(g_residual_dev_buf, layer_out, MC::n_embd);
+            write_f32_to_buf(g_residual_dev_buf, attn_out, MC::n_head * MC::head_dim);
             g_time_reswrite += std::chrono::duration<double, std::milli>(Clock::now() - t_rw2).count();
 
             auto t2 = Clock::now();
             if (!g_ffn_chain_traces_valid[layer]) {
-                ffn_chain_ops(g_wt.post_norm[layer],
-                             g_wt.attn_ffn_gate_up[attn_idx], g_wt.attn_ffn_down[attn_idx]);
+                outproj_ffn_chain_ops(g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                      g_wt.post_norm[layer],
+                                      g_wt.attn_ffn_gate_up[attn_idx], g_wt.attn_ffn_down[attn_idx]);
                 Finish(cq0);
                 auto tid = ttnn::operations::trace::begin_trace_capture(g_mesh.get(), std::nullopt);
-                ffn_chain_ops(g_wt.post_norm[layer],
-                             g_wt.attn_ffn_gate_up[attn_idx], g_wt.attn_ffn_down[attn_idx]);
+                outproj_ffn_chain_ops(g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                      g_wt.post_norm[layer],
+                                      g_wt.attn_ffn_gate_up[attn_idx], g_wt.attn_ffn_down[attn_idx]);
                 ttnn::operations::trace::end_trace_capture(g_mesh.get(), tid, std::nullopt);
                 g_ffn_chain_traces[layer] = tid;
                 g_ffn_chain_traces_valid[layer] = true;
@@ -1135,7 +1132,7 @@ static float* forward_decode() {
 bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     printf("Loading model from %s (max_ctx=%d)...\n", model_path, max_ctx);
 
-    // Open both N300 chips: chip 0 for layer weights, chip 1 for output projections
+    // Open chip 0 for layer weights + output projections, chip 1 for LM head
     auto meshes = MeshDevice::create_unit_meshes({0, 1});
     g_mesh = meshes[0];
     g_mesh2 = meshes[1];
@@ -1143,9 +1140,6 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     auto grid = g_mesh->compute_with_storage_grid_size();
     printf("Chip 0 opened: compute grid %zux%zu (%zu cores)\n",
            grid.x, grid.y, grid.x * grid.y);
-    auto grid2 = g_mesh2->compute_with_storage_grid_size();
-    printf("Chip 1 opened: compute grid %zux%zu (%zu cores)\n",
-           grid2.x, grid2.y, grid2.x * grid2.y);
 
     // Enable program cache for faster repeated matmul dispatch
     g_mesh->enable_program_cache();
@@ -1311,10 +1305,10 @@ void shutdown() {
             g_ffn_chain_traces_valid[i] = false;
         }
     }
-    // Release gemv traces (chip 0: idx 0-23,48-55; chip 1: idx 24-47,56-64)
+    // Release gemv traces (chip 0 for all except idx 64 = LM head on chip 1)
     for (int i = 0; i < 128; i++) {
         if (g_gemv_traces[i].valid) {
-            MeshDevice* dev = (i >= 24 && i <= 47) || (i >= 56) ? g_mesh2.get() : g_mesh.get();
+            MeshDevice* dev = (i == 64) ? g_mesh2.get() : g_mesh.get();
             ttnn::operations::trace::release_trace(dev, g_gemv_traces[i].trace_id);
             g_gemv_traces[i].valid = false;
         }
