@@ -42,7 +42,8 @@ using MC = ModelConfig;
 // ============================================================================
 // Global state
 // ============================================================================
-static std::shared_ptr<MeshDevice> g_mesh;
+static std::shared_ptr<MeshDevice> g_mesh;   // chip 0: layer weights
+static std::shared_ptr<MeshDevice> g_mesh2;  // chip 1: wo, ssm_out, LM head
 static ModelBuffers g_model;
 static Tokenizer g_tokenizer;
 static bool g_loaded = false;
@@ -71,15 +72,20 @@ static std::vector<float> g_conv_state[24];
 // Cached weight Tensors (wrapping on-device MeshBuffers for ttnn::matmul)
 // ============================================================================
 struct WeightTensors {
-    // Attention layers (8)
+    // Chip 0: Attention layers (8)
     Tensor attn_wqkv[8];
     Tensor attn_ffn_gate_up[8];
     Tensor attn_ffn_down[8];
 
-    // SSM layers (24)
+    // Chip 0: SSM layers (24)
     Tensor ssm_w_combined[24];
     Tensor ssm_ffn_gate_up[24];
     Tensor ssm_ffn_down[24];
+
+    // Chip 1: Output projections + LM head
+    Tensor attn_wo[8];           // [n_embd, n_head*head_dim] on chip 1
+    Tensor ssm_out[24];          // [n_embd, ssm_d_inner] on chip 1
+    Tensor lm_head;              // [n_vocab, n_embd] on chip 1
 };
 static WeightTensors g_wt;
 
@@ -95,15 +101,16 @@ static Tensor wrap_weight(std::shared_ptr<MeshBuffer> buf, uint32_t M, uint32_t 
 
 // ============================================================================
 // Device-side GEMV: y[M] = W[M,K] @ x[K]  (W on device, x/y on host)
+// device param specifies which chip to upload activation to (must match weight)
 // ============================================================================
-static void device_gemv(const Tensor& weight, uint32_t M, uint32_t K,
+static void device_gemv(MeshDevice* device, const Tensor& weight, uint32_t M, uint32_t K,
                         const float* x, float* y) {
-    // Upload activation vector to device
+    // Upload activation vector to the same device as the weight
     TensorSpec act_spec(
         Shape({1, 1, 1, K}),
         TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
     auto act = Tensor::from_span<float>(
-        std::span<const float>(x, K), act_spec, g_mesh.get());
+        std::span<const float>(x, K), act_spec, device);
 
     // matmul: [1,1,1,K] × [1,1,M,K]^T = [1,1,1,M]
     auto result = ttnn::matmul(act, weight, /*transpose_a=*/false, /*transpose_b=*/true);
@@ -115,22 +122,6 @@ static void device_gemv(const Tensor& weight, uint32_t M, uint32_t K,
 
     result.deallocate();
     act.deallocate();
-}
-
-// ============================================================================
-// Host-side GEMV for weights stored on host (wo, ssm_out, LM head)
-// ============================================================================
-static void gemv_bf16_host(const uint16_t* W, const float* x, float* y, int M, int K) {
-    for (int i = 0; i < M; i++) {
-        float sum = 0;
-        const uint16_t* row = W + (size_t)i * K;
-        for (int j = 0; j < K; j++) {
-            bfloat16 b;
-            memcpy(&b, &row[j], 2);
-            sum += static_cast<float>(b) * x[j];
-        }
-        y[i] = sum;
-    }
 }
 
 // ============================================================================
@@ -221,8 +212,24 @@ static void cache_small_weights(MeshCommandQueue& cq) {
     }
 }
 
+// Upload host bf16 data to a device as a weight Tensor [M, K] in tiled BF16 layout
+static Tensor upload_bf16_weight(MeshDevice* device, const uint16_t* bf16_data,
+                                  uint32_t M, uint32_t K) {
+    // Convert bf16 (uint16) to float for from_span
+    size_t n = (size_t)M * K;
+    std::vector<float> f32(n);
+    const bfloat16* src = reinterpret_cast<const bfloat16*>(bf16_data);
+    for (size_t i = 0; i < n; i++) f32[i] = static_cast<float>(src[i]);
+
+    TensorSpec spec(
+        Shape({1, 1, M, K}),
+        TensorLayout(DataType::BFLOAT16, PageConfig(Layout::TILE), ttnn::DRAM_MEMORY_CONFIG));
+    return Tensor::from_span<float>(std::span<const float>(f32.data(), n), spec, device);
+}
+
 // Create Tensor wrappers for all on-device weight MeshBuffers
 static void create_weight_tensors() {
+    // Chip 0: layer weights (already on device via GGUF loader)
     int attn_idx = 0, ssm_idx = 0;
     for (int layer = 0; layer < MC::n_layers; layer++) {
         if (MC::is_recurrent(layer)) {
@@ -244,8 +251,34 @@ static void create_weight_tensors() {
             attn_idx++;
         }
     }
-    printf("Created %d attention + %d SSM weight tensor wrappers for device matmul.\n",
+    printf("Created %d attention + %d SSM weight tensor wrappers on chip 0.\n",
            attn_idx, ssm_idx);
+
+    // Chip 1: wo, ssm_out, LM head (uploaded from host bf16 vectors)
+    printf("Uploading output projections to chip 1...\n");
+    for (int i = 0; i < 8; i++) {
+        auto& lw = g_model.attn_layers[i];
+        g_wt.attn_wo[i] = upload_bf16_weight(g_mesh2.get(), lw.wo_host.data(),
+                                              MC::n_embd, MC::n_head * MC::head_dim);
+        printf("  wo[%d] uploaded\n", i);
+    }
+    for (int i = 0; i < 24; i++) {
+        auto& lw = g_model.ssm_layers[i];
+        g_wt.ssm_out[i] = upload_bf16_weight(g_mesh2.get(), lw.ssm_out_host.data(),
+                                              MC::n_embd, MC::ssm_d_inner);
+        printf("  ssm_out[%d] uploaded\n", i);
+    }
+    g_wt.lm_head = upload_bf16_weight(g_mesh2.get(), g_model.output_host.data(),
+                                       MC::n_vocab, MC::n_embd);
+    printf("  lm_head uploaded\n");
+
+    // Free host bf16 vectors now that weights are on chip 1
+    for (int i = 0; i < 8; i++)
+        g_model.attn_layers[i].wo_host.clear();
+    for (int i = 0; i < 24; i++)
+        g_model.ssm_layers[i].ssm_out_host.clear();
+    g_model.output_host.clear();
+    printf("Freed host bf16 vectors (wo, ssm_out, output) — saved ~2.9 GB host RAM\n");
 }
 
 // ============================================================================
@@ -275,7 +308,7 @@ static std::vector<float> forward_decode() {
             int combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
                               + MC::ssm_dt_rank + MC::ssm_dt_rank;
             std::vector<float> proj(combined_rows);
-            device_gemv(g_wt.ssm_w_combined[ssm_idx], combined_rows, MC::n_embd,
+            device_gemv(g_mesh.get(), g_wt.ssm_w_combined[ssm_idx], combined_rows, MC::n_embd,
                        norm_out.data(), proj.data());
 
             float* qkv_raw = proj.data();
@@ -377,10 +410,10 @@ static std::vector<float> forward_decode() {
                 }
             }
 
-            // 6. Output projection (host bf16 — doesn't fit on device DRAM)
+            // 6. Output projection (DEVICE matmul on chip 1)
             std::vector<float> layer_out(MC::n_embd);
-            gemv_bf16_host(lw.ssm_out_host.data(), ssm_proj_in.data(),
-                          layer_out.data(), MC::n_embd, MC::ssm_d_inner);
+            device_gemv(g_mesh2.get(), g_wt.ssm_out[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                       ssm_proj_in.data(), layer_out.data());
 
             // 7. Residual
             for (int i = 0; i < MC::n_embd; i++)
@@ -392,7 +425,7 @@ static std::vector<float> forward_decode() {
             rmsnorm(g_hidden_f32.data(), ln.post_norm.data(), norm_out.data(), MC::n_embd);
 
             std::vector<float> ffn_buf(2 * MC::n_ff);
-            device_gemv(g_wt.ssm_ffn_gate_up[ssm_idx], 2 * MC::n_ff, MC::n_embd,
+            device_gemv(g_mesh.get(), g_wt.ssm_ffn_gate_up[ssm_idx], 2 * MC::n_ff, MC::n_embd,
                        norm_out.data(), ffn_buf.data());
 
             std::vector<float> ffn_act(MC::n_ff);
@@ -403,7 +436,7 @@ static std::vector<float> forward_decode() {
             }
 
             std::vector<float> ffn_out(MC::n_embd);
-            device_gemv(g_wt.ssm_ffn_down[ssm_idx], MC::n_embd, MC::n_ff,
+            device_gemv(g_mesh.get(), g_wt.ssm_ffn_down[ssm_idx], MC::n_embd, MC::n_ff,
                        ffn_act.data(), ffn_out.data());
 
             for (int i = 0; i < MC::n_embd; i++)
@@ -420,7 +453,7 @@ static std::vector<float> forward_decode() {
             int kv_dim_one = MC::n_head_kv * MC::head_dim;
             int total_rows = q_dim + 2 * kv_dim_one;
             std::vector<float> qkv(total_rows);
-            device_gemv(g_wt.attn_wqkv[attn_idx], total_rows, MC::n_embd,
+            device_gemv(g_mesh.get(), g_wt.attn_wqkv[attn_idx], total_rows, MC::n_embd,
                        norm_out.data(), qkv.data());
 
             // 2. Deinterleave Q and gate
@@ -498,10 +531,10 @@ static std::vector<float> forward_decode() {
             for (int i = 0; i < MC::n_head * MC::head_dim; i++)
                 attn_out[i] *= 1.0f / (1.0f + expf(-gate_heads[i]));
 
-            // 8. Output projection (host bf16 — doesn't fit on device DRAM)
+            // 8. Output projection (DEVICE matmul on chip 1)
             std::vector<float> layer_out(MC::n_embd);
-            gemv_bf16_host(lw.wo_host.data(), attn_out.data(),
-                          layer_out.data(), MC::n_embd, MC::n_head * MC::head_dim);
+            device_gemv(g_mesh2.get(), g_wt.attn_wo[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                       attn_out.data(), layer_out.data());
 
             // 9. Residual
             for (int i = 0; i < MC::n_embd; i++)
@@ -513,7 +546,7 @@ static std::vector<float> forward_decode() {
             rmsnorm(g_hidden_f32.data(), ln.post_norm.data(), norm_out.data(), MC::n_embd);
 
             std::vector<float> ffn_buf(2 * MC::n_ff);
-            device_gemv(g_wt.attn_ffn_gate_up[attn_idx], 2 * MC::n_ff, MC::n_embd,
+            device_gemv(g_mesh.get(), g_wt.attn_ffn_gate_up[attn_idx], 2 * MC::n_ff, MC::n_embd,
                        norm_out.data(), ffn_buf.data());
 
             std::vector<float> ffn_act(MC::n_ff);
@@ -524,7 +557,7 @@ static std::vector<float> forward_decode() {
             }
 
             std::vector<float> ffn_out(MC::n_embd);
-            device_gemv(g_wt.attn_ffn_down[attn_idx], MC::n_embd, MC::n_ff,
+            device_gemv(g_mesh.get(), g_wt.attn_ffn_down[attn_idx], MC::n_embd, MC::n_ff,
                        ffn_act.data(), ffn_out.data());
 
             for (int i = 0; i < MC::n_embd; i++)
@@ -540,10 +573,10 @@ static std::vector<float> forward_decode() {
     // Final norm
     rmsnorm(g_hidden_f32.data(), g_output_norm.data(), norm_out.data(), MC::n_embd);
 
-    // LM head (host bf16 — too large for device DRAM)
+    // LM head (DEVICE matmul on chip 1)
     std::vector<float> logits(MC::n_vocab);
-    gemv_bf16_host(g_model.output_host.data(), norm_out.data(),
-                  logits.data(), MC::n_vocab, MC::n_embd);
+    device_gemv(g_mesh2.get(), g_wt.lm_head, MC::n_vocab, MC::n_embd,
+               norm_out.data(), logits.data());
 
     return logits;
 }
@@ -555,13 +588,21 @@ static std::vector<float> forward_decode() {
 bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     printf("Loading model from %s (max_ctx=%d)...\n", model_path, max_ctx);
 
-    g_mesh = MeshDevice::create_unit_mesh(0);
+    // Open both N300 chips: chip 0 for layer weights, chip 1 for output projections
+    auto meshes = MeshDevice::create_unit_meshes({0, 1});
+    g_mesh = meshes[0];
+    g_mesh2 = meshes[1];
+
     auto grid = g_mesh->compute_with_storage_grid_size();
-    printf("Device opened: compute grid %dx%d (%d cores)\n",
+    printf("Chip 0 opened: compute grid %zux%zu (%zu cores)\n",
            grid.x, grid.y, grid.x * grid.y);
+    auto grid2 = g_mesh2->compute_with_storage_grid_size();
+    printf("Chip 1 opened: compute grid %zux%zu (%zu cores)\n",
+           grid2.x, grid2.y, grid2.x * grid2.y);
 
     // Enable program cache for faster repeated matmul dispatch
     g_mesh->enable_program_cache();
+    g_mesh2->enable_program_cache();
 
     MeshCommandQueue& cq = g_mesh->mesh_command_queue();
     g_max_ctx = max_ctx;
@@ -704,13 +745,17 @@ void shutdown() {
     if (!g_loaded) return;
     g_loaded = false;
 
-    // Clear weight tensor wrappers (they reference the MeshBuffers)
+    // Clear weight tensor wrappers — chip 0
     for (auto& t : g_wt.attn_wqkv) t = Tensor();
     for (auto& t : g_wt.attn_ffn_gate_up) t = Tensor();
     for (auto& t : g_wt.attn_ffn_down) t = Tensor();
     for (auto& t : g_wt.ssm_w_combined) t = Tensor();
     for (auto& t : g_wt.ssm_ffn_gate_up) t = Tensor();
     for (auto& t : g_wt.ssm_ffn_down) t = Tensor();
+    // Clear weight tensor wrappers — chip 1
+    for (auto& t : g_wt.attn_wo) t = Tensor();
+    for (auto& t : g_wt.ssm_out) t = Tensor();
+    g_wt.lm_head = Tensor();
 
     g_model.output_norm.reset();
     for (auto& l : g_model.attn_layers) {
@@ -723,6 +768,10 @@ void shutdown() {
         l.post_attn_norm.reset(); l.ffn_gate_up.reset(); l.ffn_down.reset();
     }
 
+    if (g_mesh2) {
+        g_mesh2->close();
+        g_mesh2.reset();
+    }
     if (g_mesh) {
         g_mesh->close();
         g_mesh.reset();
