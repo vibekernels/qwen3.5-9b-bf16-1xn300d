@@ -530,6 +530,124 @@ static void dispatch_gemv(MeshDevice* device,
     }
 }
 
+// Cached GEMV+ResAdd workload: GEMV output added directly to residual buffer.
+struct CachedGemvResaddWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t,uint32_t>, CachedGemvResaddWorkload> g_gemv_resadd_cache;
+
+// Fused GEMV + Residual Add: residual[1,M] += x[1,K] @ W[M,K]^T
+// Same as dispatch_gemv but the writer reads existing residual, adds GEMV output, writes back.
+// Eliminates separate dispatch_eltwise_binary call.
+static void dispatch_gemv_resadd(MeshDevice* device,
+                                  std::shared_ptr<MeshBuffer> act_buf,
+                                  std::shared_ptr<MeshBuffer> weight_buf,
+                                  std::shared_ptr<MeshBuffer> residual_buf,
+                                  uint32_t M, uint32_t K,
+                                  tt::DataFormat weight_format = tt::DataFormat::Bfp8_b) {
+    auto& cq = device->mesh_command_queue();
+    auto key = std::make_tuple((uint32_t)act_buf->address(),
+                               (uint32_t)weight_buf->address(),
+                               (uint32_t)residual_buf->address(), M);
+    auto& cached = g_gemv_resadd_cache[key];
+
+    if (!cached.valid) {
+        MeshCoordinateRange dev_range(device->shape());
+
+        uint32_t Kt = K / TILE_WIDTH;
+        uint32_t Mt = M / TILE_HEIGHT;
+        uint32_t num_banks = g_num_dram_banks;
+        uint32_t Mt_per_bank = (Mt + num_banks - 1) / num_banks;
+
+        std::vector<CoreRange> core_ranges;
+        for (uint32_t b = 0; b < num_banks; b++) {
+            auto& c = g_dram_workers[b];
+            core_ranges.push_back(CoreRange(c, c));
+        }
+        CoreRangeSet all_cores(core_ranges);
+
+        Program program = CreateProgram();
+
+        uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+        uint32_t weight_tile_bytes = tile_size(weight_format);
+
+        uint32_t effective_block = 16;
+        uint32_t weight_cb_tiles = effective_block * 2;
+
+        // Activation CB (c_0)
+        CircularBufferConfig cb_act_cfg =
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_0, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_act_cfg);
+
+        // Weight CB (c_1)
+        CircularBufferConfig cb_weight_cfg =
+            CircularBufferConfig(weight_cb_tiles * weight_tile_bytes, {{CBIndex::c_1, weight_format}})
+                .set_page_size(CBIndex::c_1, weight_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_weight_cfg);
+
+        // Output CB (c_16)
+        CircularBufferConfig cb_out_cfg =
+            CircularBufferConfig(2 * bf16_tile_bytes, {{CBIndex::c_16, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_16, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_out_cfg);
+
+        // Scratch CB (c_2) for writer to read residual tiles
+        CircularBufferConfig cb_scratch_cfg =
+            CircularBufferConfig(bf16_tile_bytes, {{CBIndex::c_2, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_2, bf16_tile_bytes);
+        CreateCircularBuffer(program, all_cores, cb_scratch_cfg);
+
+        // Reader: same as regular GEMV
+        std::vector<uint32_t> reader_ct_args = {(uint32_t)CBIndex::c_0, (uint32_t)CBIndex::c_1, Kt, effective_block};
+        TensorAccessorArgs(*act_buf).append_to(reader_ct_args);
+
+        auto reader_kid = CreateKernel(program,
+            kernel_path("dataflow/reader_gemv_dram_sharded.cpp"), all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                               .noc = NOC::RISCV_1_default,
+                               .compile_args = reader_ct_args});
+
+        // Compute: same as regular GEMV
+        std::vector<uint32_t> compute_ct_args = {Kt, effective_block};
+        auto compute_kid = CreateKernel(program,
+            kernel_path("compute/gemv.cpp"), all_cores,
+            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+
+        // Writer: fused resadd writer (reads residual, adds output, writes back)
+        std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
+        TensorAccessorArgs(*residual_buf).append_to(writer_ct_args);
+
+        auto writer_kid = CreateKernel(program,
+            kernel_path("dataflow/writer_gemv_resadd.cpp"), all_cores,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
+                               .noc = NOC::RISCV_0_default,
+                               .compile_args = writer_ct_args});
+
+        for (uint32_t b = 0; b < num_banks; b++) {
+            CoreCoord core = g_dram_workers[b];
+            uint32_t start_row = b * Mt_per_bank;
+            uint32_t mt_this_core = (start_row >= Mt) ? 0 :
+                                    std::min(Mt_per_bank, Mt - start_row);
+
+            SetRuntimeArgs(program, reader_kid, core,
+                           {(uint32_t)act_buf->address(), (uint32_t)weight_buf->address(),
+                            mt_this_core, b});
+            SetRuntimeArgs(program, compute_kid, core, {mt_this_core});
+            SetRuntimeArgs(program, writer_kid, core,
+                           {(uint32_t)residual_buf->address(), mt_this_core, start_row});
+        }
+
+        cached.workload = MeshWorkload();
+        cached.workload.add_program(dev_range, std::move(program));
+        EnqueueMeshWorkload(cq, cached.workload, false);
+        cached.valid = true;
+    } else {
+        EnqueueMeshWorkload(cq, cached.workload, false);
+    }
+}
+
 // Cached SwiGLU workload: SiLU(gate) * up
 struct CachedSwigluWorkload {
     MeshWorkload workload;
@@ -1031,25 +1149,19 @@ static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf
                                    std::shared_ptr<MeshBuffer> gate_weight_buf,
                                    std::shared_ptr<MeshBuffer> up_weight_buf,
                                    std::shared_ptr<MeshBuffer> down_weight_buf) {
-    // 1. Output projection: matmul(residual, outproj_weight)
-    auto& gb_op = get_gemv_buf(g_mesh.get(), outproj_M, outproj_K);
-    dispatch_gemv(g_mesh.get(), g_residual_dev_buf, outproj_weight_buf, gb_op.out_buf,
-                  outproj_M, outproj_K);
+    // 1. Output projection + residual add (fused): hidden += residual @ outproj_weight^T
+    dispatch_gemv_resadd(g_mesh.get(), g_residual_dev_buf, outproj_weight_buf,
+                         g_hidden_dev_buf, outproj_M, outproj_K);
 
-    // 2. Residual add: hidden += outproj result (custom kernel)
+    // 2. RMSNorm (multi-core: 12 cores each handle local bank's tiles)
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
-    dispatch_eltwise_binary(g_mesh.get(), 0 /*add*/, g_hidden_dev_buf, gb_op.out_buf,
-                            g_hidden_dev_buf, embd_tiles);
-
-    // 3. RMSNorm (multi-core: 12 cores each handle local bank's tiles)
     dispatch_rmsnorm_multicore(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
                                 g_norm_dev_buf, MC::n_embd, embd_tiles);
 
-    // 4. FFN: gate + up matmuls → SwiGLU (SiLU(gate)*up) → down matmul
+    // 3. FFN: gate + up matmuls → SwiGLU (SiLU(gate)*up) → down matmul + residual add
     auto& fb = get_ffn_buf(g_mesh.get());
-    auto& gb_dn = get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_ff);
 
-    // Gate projection (no fused activation)
+    // Gate projection
     dispatch_gemv(g_mesh.get(), g_norm_dev_buf, gate_weight_buf, fb.gate_buf,
                   MC::n_ff, MC::n_embd);
 
@@ -1061,13 +1173,9 @@ static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf
     constexpr uint32_t ff_tiles = MC::n_ff / TILE_WIDTH;
     dispatch_swiglu(g_mesh.get(), fb.gate_buf, fb.up_buf, fb.act_buf, ff_tiles);
 
-    // Down projection
-    dispatch_gemv(g_mesh.get(), fb.act_buf, down_weight_buf, gb_dn.out_buf,
-                  MC::n_embd, MC::n_ff);
-
-    // 5. Residual add: hidden += ffn_out (custom kernel)
-    dispatch_eltwise_binary(g_mesh.get(), 0 /*add*/, g_hidden_dev_buf, gb_dn.out_buf,
-                            g_hidden_dev_buf, embd_tiles);
+    // Down projection + residual add (fused): hidden += act @ down_weight^T
+    dispatch_gemv_resadd(g_mesh.get(), fb.act_buf, down_weight_buf,
+                         g_hidden_dev_buf, MC::n_embd, MC::n_ff);
 }
 
 // Separate tiled host buffer for write_f32_to_buf (declared before use)
@@ -1815,93 +1923,97 @@ static float* forward_decode() {
             float* conv_k = conv_out + num_k_heads * head_k;
             float* conv_v = conv_out + 2 * num_k_heads * head_k;
 
-            // 4. Delta-net recurrence + 5. Gated RMSNorm
+            // 4. Delta-net recurrence + 5. Gated RMSNorm (parallelized across v-heads)
             auto t_delta = Clock::now();
             auto& state = g_ssm_state[ssm_idx];
             float* ssm_proj_in = g_ssm_proj_in.data();
             constexpr float ssm_scale = 1.0f / 11.3137f;
 
-            for (int vh = 0; vh < num_v; vh++) {
-                int kh = vh % num_k_heads;
-                alignas(64) float q[head_k], k_vec[head_k], v_vec[head_v];
-                memcpy(q, conv_q + kh * head_k, head_k * sizeof(float));
-                memcpy(k_vec, conv_k + kh * head_k, head_k * sizeof(float));
-                memcpy(v_vec, conv_v + vh * head_v, head_v * sizeof(float));
+            // Process a range of v-heads (lambda for parallel execution)
+            auto process_vheads = [&](int vh_start, int vh_end) {
+                for (int vh = vh_start; vh < vh_end; vh++) {
+                    int kh = vh % num_k_heads;
+                    alignas(64) float q[head_k], k_vec[head_k], v_vec[head_v];
+                    memcpy(q, conv_q + kh * head_k, head_k * sizeof(float));
+                    memcpy(k_vec, conv_k + kh * head_k, head_k * sizeof(float));
+                    memcpy(v_vec, conv_v + vh * head_v, head_v * sizeof(float));
 
-                // RMSNorm Q and K using AVX-512
-                __m512 vqn = _mm512_setzero_ps(), vkn = _mm512_setzero_ps();
-                for (int d = 0; d < head_k; d += 16) {
-                    __m512 vq = _mm512_load_ps(q + d);
-                    __m512 vk = _mm512_load_ps(k_vec + d);
-                    vqn = _mm512_fmadd_ps(vq, vq, vqn);
-                    vkn = _mm512_fmadd_ps(vk, vk, vkn);
-                }
-                float qn_s = 1.0f / sqrtf(_mm512_reduce_add_ps(vqn) + MC::rms_norm_eps);
-                float kn_s = 1.0f / sqrtf(_mm512_reduce_add_ps(vkn) + MC::rms_norm_eps);
-                __m512 vqn_b = _mm512_set1_ps(qn_s);
-                __m512 vkn_b = _mm512_set1_ps(kn_s);
-                for (int d = 0; d < head_k; d += 16) {
-                    _mm512_store_ps(q + d, _mm512_mul_ps(_mm512_load_ps(q + d), vqn_b));
-                    _mm512_store_ps(k_vec + d, _mm512_mul_ps(_mm512_load_ps(k_vec + d), vkn_b));
-                }
-
-                float biased = alpha_raw[vh] + lw.ssm_dt_bias_host[vh];
-                float sp = (biased > 20.0f) ? biased : logf(1.0f + fast_expf(biased));
-                float gate_val = sp * lw.ssm_a_host[vh];
-                float decay = expf(gate_val);
-                float beta_val = fast_sigmoidf(beta_raw[vh]);
-                float* sh = state.data() + vh * head_v * head_k;
-
-                // Fused per-row: decay + dot(k) + update + dot(q)
-                // Eliminates separate bulk decay pass, halves memory traffic
-                __m512 vdecay = _mm512_set1_ps(decay);
-                for (int i = 0; i < head_v; i++) {
-                    float* row = sh + i * head_k;
-                    // Pass 1: decay row, compute dot(row*decay, k)
-                    __m512 vsk = _mm512_setzero_ps();
-                    for (int j = 0; j < head_k; j += 16) {
-                        __m512 vr = _mm512_mul_ps(_mm512_loadu_ps(row + j), vdecay);
-                        _mm512_storeu_ps(row + j, vr);
-                        vsk = _mm512_fmadd_ps(vr, _mm512_load_ps(k_vec + j), vsk);
+                    // RMSNorm Q and K using AVX-512
+                    __m512 vqn = _mm512_setzero_ps(), vkn = _mm512_setzero_ps();
+                    for (int d = 0; d < head_k; d += 16) {
+                        __m512 vq = _mm512_load_ps(q + d);
+                        __m512 vk = _mm512_load_ps(k_vec + d);
+                        vqn = _mm512_fmadd_ps(vq, vq, vqn);
+                        vkn = _mm512_fmadd_ps(vk, vk, vkn);
                     }
-                    float sk = _mm512_reduce_add_ps(vsk);
-                    float dd = beta_val * (v_vec[i] - sk);
-                    __m512 vdd = _mm512_set1_ps(dd);
-                    // Pass 2: update row, compute dot(updated_row, q)
-                    __m512 vout = _mm512_setzero_ps();
-                    for (int j = 0; j < head_k; j += 16) {
-                        __m512 vr = _mm512_loadu_ps(row + j);
-                        __m512 vk = _mm512_load_ps(k_vec + j);
-                        vr = _mm512_fmadd_ps(vk, vdd, vr);  // row += k * dd
-                        _mm512_storeu_ps(row + j, vr);
-                        vout = _mm512_fmadd_ps(vr, _mm512_load_ps(q + j), vout);
+                    float qn_s = 1.0f / sqrtf(_mm512_reduce_add_ps(vqn) + MC::rms_norm_eps);
+                    float kn_s = 1.0f / sqrtf(_mm512_reduce_add_ps(vkn) + MC::rms_norm_eps);
+                    __m512 vqn_b = _mm512_set1_ps(qn_s);
+                    __m512 vkn_b = _mm512_set1_ps(kn_s);
+                    for (int d = 0; d < head_k; d += 16) {
+                        _mm512_store_ps(q + d, _mm512_mul_ps(_mm512_load_ps(q + d), vqn_b));
+                        _mm512_store_ps(k_vec + d, _mm512_mul_ps(_mm512_load_ps(k_vec + d), vkn_b));
                     }
-                    ssm_proj_in[vh * head_v + i] = _mm512_reduce_add_ps(vout) * ssm_scale;
-                }
 
-                // Gated RMSNorm for this v-head (AVX-512)
-                float* vout = ssm_proj_in + vh * head_v;
-                __m512 vssq = _mm512_setzero_ps();
-                for (int d = 0; d < head_v; d += 16) {
-                    __m512 vv = _mm512_loadu_ps(vout + d);
-                    vssq = _mm512_fmadd_ps(vv, vv, vssq);
-                }
-                float rms = 1.0f / sqrtf(_mm512_reduce_add_ps(vssq) / head_v + MC::rms_norm_eps);
-                __m512 vrms = _mm512_set1_ps(rms);
-                for (int d = 0; d < head_v; d += 16) {
-                    __m512 vv = _mm512_loadu_ps(vout + d);
-                    __m512 vnorm = _mm512_mul_ps(_mm512_mul_ps(vv, vrms),
-                                                  _mm512_loadu_ps(lw.ssm_norm_host.data() + d));
-                    // SiLU(z) = z * sigmoid(z) — scalar fallback for transcendentals
-                    float tmp[16];
-                    _mm512_storeu_ps(tmp, vnorm);
-                    for (int t = 0; t < 16 && d + t < head_v; t++) {
-                        float z = z_raw[vh * head_v + d + t];
-                        tmp[t] *= fast_siluf(z);
+                    float biased = alpha_raw[vh] + lw.ssm_dt_bias_host[vh];
+                    float sp = (biased > 20.0f) ? biased : logf(1.0f + fast_expf(biased));
+                    float gate_val = sp * lw.ssm_a_host[vh];
+                    float decay = expf(gate_val);
+                    float beta_val = fast_sigmoidf(beta_raw[vh]);
+                    float* sh = state.data() + vh * head_v * head_k;
+
+                    __m512 vdecay = _mm512_set1_ps(decay);
+                    for (int i = 0; i < head_v; i++) {
+                        float* row = sh + i * head_k;
+                        __m512 vsk = _mm512_setzero_ps();
+                        for (int j = 0; j < head_k; j += 16) {
+                            __m512 vr = _mm512_mul_ps(_mm512_loadu_ps(row + j), vdecay);
+                            _mm512_storeu_ps(row + j, vr);
+                            vsk = _mm512_fmadd_ps(vr, _mm512_load_ps(k_vec + j), vsk);
+                        }
+                        float sk = _mm512_reduce_add_ps(vsk);
+                        float dd = beta_val * (v_vec[i] - sk);
+                        __m512 vdd = _mm512_set1_ps(dd);
+                        __m512 vout_acc = _mm512_setzero_ps();
+                        for (int j = 0; j < head_k; j += 16) {
+                            __m512 vr = _mm512_loadu_ps(row + j);
+                            __m512 vk = _mm512_load_ps(k_vec + j);
+                            vr = _mm512_fmadd_ps(vk, vdd, vr);
+                            _mm512_storeu_ps(row + j, vr);
+                            vout_acc = _mm512_fmadd_ps(vr, _mm512_load_ps(q + j), vout_acc);
+                        }
+                        ssm_proj_in[vh * head_v + i] = _mm512_reduce_add_ps(vout_acc) * ssm_scale;
                     }
-                    _mm512_storeu_ps(vout + d, _mm512_loadu_ps(tmp));
+
+                    // Gated RMSNorm for this v-head (AVX-512)
+                    float* vo = ssm_proj_in + vh * head_v;
+                    __m512 vssq = _mm512_setzero_ps();
+                    for (int d = 0; d < head_v; d += 16) {
+                        __m512 vv = _mm512_loadu_ps(vo + d);
+                        vssq = _mm512_fmadd_ps(vv, vv, vssq);
+                    }
+                    float rms = 1.0f / sqrtf(_mm512_reduce_add_ps(vssq) / head_v + MC::rms_norm_eps);
+                    __m512 vrms = _mm512_set1_ps(rms);
+                    for (int d = 0; d < head_v; d += 16) {
+                        __m512 vv = _mm512_loadu_ps(vo + d);
+                        __m512 vnorm = _mm512_mul_ps(_mm512_mul_ps(vv, vrms),
+                                                      _mm512_loadu_ps(lw.ssm_norm_host.data() + d));
+                        float tmp[16];
+                        _mm512_storeu_ps(tmp, vnorm);
+                        for (int t = 0; t < 16 && d + t < head_v; t++) {
+                            float z = z_raw[vh * head_v + d + t];
+                            tmp[t] *= fast_siluf(z);
+                        }
+                        _mm512_storeu_ps(vo + d, _mm512_loadu_ps(tmp));
+                    }
                 }
-            }
+            };
+
+            // Parallelize across 2 threads (main + 1 worker)
+            constexpr int mid_vh = num_v / 2;
+            std::thread worker(process_vheads, 0, mid_vh);
+            process_vheads(mid_vh, num_v);
+            worker.join();
 
             g_time_deltanet += std::chrono::duration<double, std::milli>(Clock::now() - t_delta).count();
             g_time_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host0).count();
