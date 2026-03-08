@@ -934,6 +934,120 @@ static void dispatch_rmsnorm_multicore(MeshDevice* device,
     }
 }
 
+// FPU-based single-core RMSNorm using Tensix compute engine.
+// Much faster than software-float multicore version (~0.1ms vs ~1.9ms).
+struct CachedFpuRmsnormWorkload {
+    MeshWorkload workload;
+    bool valid = false;
+};
+static std::map<std::tuple<uint32_t,uint32_t,uint32_t>, CachedFpuRmsnormWorkload> g_fpu_rmsnorm_cache;
+
+static void dispatch_rmsnorm_fpu(MeshDevice* device,
+                                  std::shared_ptr<MeshBuffer> in_buf,
+                                  std::shared_ptr<MeshBuffer> weight_buf,
+                                  std::shared_ptr<MeshBuffer> out_buf,
+                                  uint32_t n_elements, uint32_t n_tiles) {
+    auto& cq = device->mesh_command_queue();
+    auto key = std::make_tuple((uint32_t)in_buf->address(),
+                               (uint32_t)weight_buf->address(), (uint32_t)out_buf->address());
+    auto& cached = g_fpu_rmsnorm_cache[key];
+
+    if (!cached.valid) {
+        MeshCoordinateRange dev_range(device->shape());
+        Program program = CreateProgram();
+
+        // Use a single worker core (first DRAM worker)
+        auto core = g_dram_workers[0];
+        CoreRange single_core(core, core);
+        CoreRangeSet core_set({single_core});
+
+        uint32_t Kt = n_tiles;
+        uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
+
+        // cb_hidden (c_0): Kt tiles — input, reused for output
+        CircularBufferConfig cb_hidden_cfg =
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_0, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_0, bf16_tile_bytes);
+        CreateCircularBuffer(program, core_set, cb_hidden_cfg);
+
+        // cb_norm_w (c_2): Kt tiles
+        CircularBufferConfig cb_norm_cfg =
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_2, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_2, bf16_tile_bytes);
+        CreateCircularBuffer(program, core_set, cb_norm_cfg);
+
+        // cb_x2/act (c_24): Kt tiles shared
+        CircularBufferConfig cb_x2_cfg =
+            CircularBufferConfig(Kt * bf16_tile_bytes, {{CBIndex::c_24, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_24, bf16_tile_bytes);
+        CreateCircularBuffer(program, core_set, cb_x2_cfg);
+
+        // cb_var (c_4): 1 tile
+        CircularBufferConfig cb_var_cfg =
+            CircularBufferConfig(bf16_tile_bytes, {{CBIndex::c_4, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_4, bf16_tile_bytes);
+        CreateCircularBuffer(program, core_set, cb_var_cfg);
+
+        // cb_scaler (c_5): 1 tile
+        CircularBufferConfig cb_scaler_cfg =
+            CircularBufferConfig(bf16_tile_bytes, {{CBIndex::c_5, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_5, bf16_tile_bytes);
+        CreateCircularBuffer(program, core_set, cb_scaler_cfg);
+
+        // cb_eps (c_6): 1 tile
+        CircularBufferConfig cb_eps_cfg =
+            CircularBufferConfig(bf16_tile_bytes, {{CBIndex::c_6, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_6, bf16_tile_bytes);
+        CreateCircularBuffer(program, core_set, cb_eps_cfg);
+
+        // cb_rsqrt (c_7): 1 tile
+        CircularBufferConfig cb_rsqrt_cfg =
+            CircularBufferConfig(bf16_tile_bytes, {{CBIndex::c_7, tt::DataFormat::Float16_b}})
+                .set_page_size(CBIndex::c_7, bf16_tile_bytes);
+        CreateCircularBuffer(program, core_set, cb_rsqrt_cfg);
+
+        // Reader kernel
+        std::vector<uint32_t> reader_ct_args = {Kt};
+        TensorAccessorArgs(*in_buf).append_to(reader_ct_args);
+        TensorAccessorArgs(*weight_buf).append_to(reader_ct_args);
+
+        auto reader_kid = CreateKernel(program,
+            kernel_path("dataflow/reader_rmsnorm_fpu.cpp"), core_set,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_1,
+                               .noc = NOC::RISCV_1_default,
+                               .compile_args = reader_ct_args});
+
+        // Compute kernel
+        std::vector<uint32_t> compute_ct_args = {Kt};
+        auto compute_kid = CreateKernel(program,
+            kernel_path("compute/rmsnorm_fpu.cpp"), core_set,
+            ComputeConfig{.math_fidelity = MathFidelity::HiFi4, .compile_args = compute_ct_args});
+
+        // Writer kernel
+        std::vector<uint32_t> writer_ct_args = {Kt};
+        TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
+
+        auto writer_kid = CreateKernel(program,
+            kernel_path("dataflow/writer_rmsnorm_fpu.cpp"), core_set,
+            DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
+                               .noc = NOC::RISCV_0_default,
+                               .compile_args = writer_ct_args});
+
+        // Runtime args
+        SetRuntimeArgs(program, reader_kid, core,
+                       {(uint32_t)in_buf->address(), (uint32_t)weight_buf->address(), n_elements});
+        SetRuntimeArgs(program, writer_kid, core,
+                       {(uint32_t)out_buf->address()});
+
+        cached.workload = MeshWorkload();
+        cached.workload.add_program(dev_range, std::move(program));
+        EnqueueMeshWorkload(cq, cached.workload, false);
+        cached.valid = true;
+    } else {
+        EnqueueMeshWorkload(cq, cached.workload, false);
+    }
+}
+
 // ============================================================================
 // Pre-allocated intermediate buffers for on-device FFN
 // ============================================================================
@@ -1016,10 +1130,10 @@ static void outproj_ffn_chain_ops(std::shared_ptr<MeshBuffer> outproj_weight_buf
     dispatch_gemv_resadd(g_mesh.get(), g_residual_dev_buf, outproj_weight_buf,
                          g_hidden_dev_buf, outproj_M, outproj_K);
 
-    // 2. RMSNorm (multi-core: 12 cores each handle local bank's tiles)
+    // 2. RMSNorm (single-core FPU — much faster than software-float multicore)
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
-    dispatch_rmsnorm_multicore(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
-                                g_norm_dev_buf, MC::n_embd, embd_tiles);
+    dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
+                          g_norm_dev_buf, MC::n_embd, embd_tiles);
 
     // 3. FFN: gate + up matmuls → SwiGLU (SiLU(gate)*up) → down matmul + residual add
     auto& fb = get_ffn_buf(g_mesh.get());

@@ -46,9 +46,11 @@ void kernel_main() {
     uint32_t sem1_addr = get_semaphore(sem1_id);
 
     // Use CB c_2 for scratch space (inter-core communication)
+    // Reserve + push immediately so the CB is balanced for trace replays
     constexpr uint32_t cb_scratch = tt::CBIndex::c_2;
     cb_reserve_back(cb_scratch, 1);
     uint32_t scratch_addr = get_write_ptr(cb_scratch);
+    cb_push_back(cb_scratch, 1);
 
     constexpr uint32_t n_tiles   = get_compile_time_arg_val(0);
     constexpr uint32_t num_cores = get_compile_time_arg_val(1);
@@ -218,11 +220,13 @@ void kernel_main() {
     }
     noc_async_write_barrier();
 
-    // Release CBs
+    // Release CBs (balanced for trace replay)
     cb_push_back(cb_in, my_tiles);
     cb_wait_front(cb_in, my_tiles);
     cb_pop_front(cb_in, my_tiles);
     cb_push_back(cb_weight, my_tiles);
     cb_wait_front(cb_weight, my_tiles);
     cb_pop_front(cb_weight, my_tiles);
+    cb_wait_front(cb_scratch, 1);
+    cb_pop_front(cb_scratch, 1);
 }
