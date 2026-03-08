@@ -1885,7 +1885,7 @@ static float* forward_decode() {
             if (layer > 0)
                 read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
 
-            // Host rmsnorm (~0.03ms vs slow software float on RISC-V)
+            // Host rmsnorm (AVX-512, ~0.03ms — faster than device software float)
             rmsnorm(g_hidden_f32.data(), g_layer_norms[layer].attn_norm.data(),
                     g_norm_out.data(), MC::n_embd);
             write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);
@@ -2073,7 +2073,7 @@ static float* forward_decode() {
             if (layer > 0)
                 read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
 
-            // Host rmsnorm
+            // Host rmsnorm (AVX-512, faster than device software float)
             rmsnorm(g_hidden_f32.data(), g_layer_norms[layer].attn_norm.data(),
                     g_norm_out.data(), MC::n_embd);
             write_f32_to_buf(g_norm_dev_buf, g_norm_out.data(), MC::n_embd);

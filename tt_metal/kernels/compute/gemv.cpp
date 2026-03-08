@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Compute kernel for GEMV: accumulates matmul_tiles over K dimension.
 // Activation tiles are pre-loaded in cb_act (Kt tiles, not consumed until end).
-// Weight tiles are consumed one at a time from cb_weight.
-// Compile-time args: [Kt]
+// Weight tiles consumed in BLOCK-sized batches matching reader's TRID pipelining.
+// Compile-time args: [Kt, BLOCK]
 // Runtime args: [Mt_per_core]
 
 #include <cstdint>
@@ -11,7 +11,8 @@
 
 void kernel_main() {
     uint32_t Mt = get_arg_val<uint32_t>(0);
-    constexpr uint32_t Kt = get_compile_time_arg_val(0);
+    constexpr uint32_t Kt    = get_compile_time_arg_val(0);
+    constexpr uint32_t BLOCK = get_compile_time_arg_val(1);
 
     constexpr uint32_t cb_act    = tt::CBIndex::c_0;
     constexpr uint32_t cb_weight = tt::CBIndex::c_1;
@@ -22,17 +23,22 @@ void kernel_main() {
     // Wait for all activation tiles to be loaded by reader
     cb_wait_front(cb_act, Kt);
 
+    constexpr uint32_t num_blocks = (Kt + BLOCK - 1) / BLOCK;
+
     for (uint32_t mt = 0; mt < Mt; mt++) {
         acquire_dst();
 
-        for (uint32_t kt = 0; kt < Kt; kt++) {
-            cb_wait_front(cb_weight, 1);
+        for (uint32_t blk = 0; blk < num_blocks; blk++) {
+            constexpr uint32_t full_blocks = Kt / BLOCK;
+            uint32_t batch = (blk < full_blocks) ? BLOCK : (Kt - blk * BLOCK);
 
-            // Accumulate: dst[0] += act[kt] @ weight[0]^T
-            // act tile index = kt (pre-loaded, not consumed)
-            matmul_tiles(cb_act, cb_weight, kt, 0, 0);
+            cb_wait_front(cb_weight, batch);
 
-            cb_pop_front(cb_weight, 1);
+            for (uint32_t b = 0; b < batch; b++) {
+                matmul_tiles(cb_act, cb_weight, blk * BLOCK + b, b, 0);
+            }
+
+            cb_pop_front(cb_weight, batch);
         }
 
         // Pack accumulated result to output CB
