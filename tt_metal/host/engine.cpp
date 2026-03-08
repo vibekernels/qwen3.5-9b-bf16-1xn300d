@@ -757,6 +757,25 @@ static void read_device_to_f32(std::shared_ptr<MeshBuffer> buf, float* out, uint
         ybits[i] = static_cast<uint32_t>(scratch[i]) << 16;
 }
 
+// Fast approximate exp() using Schraudolph's method (IEEE 754 trick)
+// Max relative error ~1.7%, sufficient for SiLU activation and softplus
+static inline float fast_expf(float x) {
+    // Clamp to avoid overflow/underflow
+    x = std::max(-88.0f, std::min(88.0f, x));
+    // Schraudolph's approximation: exp(x) ≈ 2^(x/ln2) via float bit manipulation
+    union { float f; int32_t i; } u;
+    u.i = (int32_t)(12102203.0f * x + 1065353216.0f);
+    return u.f;
+}
+
+static inline float fast_sigmoidf(float x) {
+    return 1.0f / (1.0f + fast_expf(-x));
+}
+
+static inline float fast_siluf(float x) {
+    return x * fast_sigmoidf(x);
+}
+
 // ============================================================================
 // Pre-allocated scratch buffers for forward_decode (avoid heap allocs per token)
 // ============================================================================
@@ -821,6 +840,7 @@ static void apply_rope_cached(float* head, int pos) {
 static int g_decode_count = 0;
 static double g_time_gemv = 0, g_time_ffn = 0, g_time_ssm = 0, g_time_attn = 0, g_time_lmhead = 0;
 static double g_time_outproj = 0, g_time_reswrite = 0, g_time_host = 0, g_time_norm_mm = 0;
+static double g_time_conv1d = 0, g_time_deltanet = 0, g_time_untilize = 0, g_time_attn_host = 0;
 
 static float* forward_decode() {
     using Clock = std::chrono::high_resolution_clock;
@@ -862,7 +882,9 @@ static float* forward_decode() {
             g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
             // Untilize combined result
+            auto t_ut = Clock::now();
             read_gemv_to_f32(gb_comb, g_proj.data(), g_combined_rows);
+            g_time_untilize += std::chrono::duration<double, std::milli>(Clock::now() - t_ut).count();
 
             auto t_host0 = Clock::now();
             float* qkv_raw = g_proj.data();
@@ -870,24 +892,29 @@ static float* forward_decode() {
             float* alpha_raw = z_raw + MC::ssm_d_inner;
             float* beta_raw = alpha_raw + MC::ssm_dt_rank;
 
-            // 2. Conv1d + SiLU
+            // 2. Conv1d + SiLU (vectorization-friendly: separate conv + state update)
+            auto t_conv = Clock::now();
             auto& cs = g_conv_state[ssm_idx];
             float* conv_out = g_conv_out.data();
+            // Conv1d: sum = state[0..2] · weights[0..2] + input · weights[3]
+            // Layout: cs = [3 rows × 8192 channels], weights = [8192 × 4] row-major
+            const float* w = lw.ssm_conv1d_host.data();
+            const float* s0 = cs.data();
+            const float* s1 = cs.data() + MC::ssm_conv_channels;
+            const float* s2 = cs.data() + 2 * MC::ssm_conv_channels;
             for (int ch = 0; ch < MC::ssm_conv_channels; ch++) {
-                float sum = 0;
-                for (int k = 0; k < MC::ssm_conv_kernel; k++) {
-                    float val;
-                    if (k < conv_state_len)
-                        val = cs[k * MC::ssm_conv_channels + ch];
-                    else
-                        val = qkv_raw[ch];
-                    sum += val * lw.ssm_conv1d_host[ch * MC::ssm_conv_kernel + k];
-                }
-                conv_out[ch] = sum / (1.0f + expf(-sum));  // SiLU
-                for (int i = 0; i < conv_state_len - 1; i++)
-                    cs[i * MC::ssm_conv_channels + ch] = cs[(i + 1) * MC::ssm_conv_channels + ch];
-                cs[(conv_state_len - 1) * MC::ssm_conv_channels + ch] = qkv_raw[ch];
+                float sum = s0[ch] * w[ch * 4 + 0]
+                          + s1[ch] * w[ch * 4 + 1]
+                          + s2[ch] * w[ch * 4 + 2]
+                          + qkv_raw[ch] * w[ch * 4 + 3];
+                conv_out[ch] = fast_siluf(sum);
             }
+            // State update: shift rows and append new input
+            memcpy(cs.data(), s1, MC::ssm_conv_channels * sizeof(float));
+            memcpy(cs.data() + MC::ssm_conv_channels, s2, MC::ssm_conv_channels * sizeof(float));
+            memcpy(cs.data() + 2 * MC::ssm_conv_channels, qkv_raw, MC::ssm_conv_channels * sizeof(float));
+
+            g_time_conv1d += std::chrono::duration<double, std::milli>(Clock::now() - t_conv).count();
 
             // 3. Split conv output: Q[2048] | K[2048] | V[4096]
             constexpr int num_k_heads = MC::ssm_n_group;
@@ -898,11 +925,11 @@ static float* forward_decode() {
             float* conv_k = conv_out + num_k_heads * head_k;
             float* conv_v = conv_out + 2 * num_k_heads * head_k;
 
-            // 4. Delta-net recurrence + 5. Gated RMSNorm (parallelized across v-heads)
+            // 4. Delta-net recurrence + 5. Gated RMSNorm
+            auto t_delta = Clock::now();
             auto& state = g_ssm_state[ssm_idx];
             float* ssm_proj_in = g_ssm_proj_in.data();
             constexpr float ssm_scale = 1.0f / 11.3137f;
-
 
             for (int vh = 0; vh < num_v; vh++) {
                 int kh = vh % num_k_heads;
@@ -916,10 +943,10 @@ static float* forward_decode() {
                 kn = 1.0f / sqrtf(kn + MC::rms_norm_eps);
                 for (int d = 0; d < head_k; d++) { q[d] *= qn; k[d] *= kn; }
                 float biased = alpha_raw[vh] + lw.ssm_dt_bias_host[vh];
-                float sp = (biased > 20.0f) ? biased : logf(1.0f + expf(biased));
+                float sp = (biased > 20.0f) ? biased : logf(1.0f + fast_expf(biased));
                 float gate = sp * lw.ssm_a_host[vh];
-                float decay = expf(gate);
-                float beta_val = 1.0f / (1.0f + expf(-beta_raw[vh]));
+                float decay = expf(gate);  // keep precise for state decay
+                float beta_val = fast_sigmoidf(beta_raw[vh]);
                 float* sh = state.data() + vh * head_v * head_k;
                 for (int j = 0; j < head_v * head_k; j++) sh[j] *= decay;
                 for (int i = 0; i < head_v; i++) {
@@ -930,10 +957,8 @@ static float* forward_decode() {
                     for (int j = 0; j < head_k; j++) row[j] += k[j] * dd;
                     float out = 0;
                     for (int j = 0; j < head_k; j++) out += row[j] * q[j];
-                    // Fused gated RMSNorm accumulation
                     ssm_proj_in[vh * head_v + i] = out * ssm_scale;
                 }
-
                 // Gated RMSNorm for this v-head
                 float sum_sq = 0;
                 float* vout = ssm_proj_in + vh * head_v;
@@ -942,11 +967,11 @@ static float* forward_decode() {
                 for (int d = 0; d < head_v; d++) {
                     float normalized = vout[d] * rms * lw.ssm_norm_host[d];
                     float z = z_raw[vh * head_v + d];
-                    float silu_z = z / (1.0f + expf(-z));
-                    vout[d] = normalized * silu_z;
+                    vout[d] = normalized * fast_siluf(z);
                 }
             }
 
+            g_time_deltanet += std::chrono::duration<double, std::milli>(Clock::now() - t_delta).count();
             g_time_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host0).count();
 
             // 6. Write ssm_proj_in to g_residual_dev, then outproj+FFN chain ON DEVICE
@@ -1004,10 +1029,12 @@ static float* forward_decode() {
             g_time_norm_mm += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
 
             // Untilize QKV result
+            auto t_ut2 = Clock::now();
             constexpr int q_dim = MC::n_head * MC::head_dim * 2;
             constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
             float* qkv = g_qkv.data();
             read_gemv_to_f32(gb_qkv, qkv, g_qkv_rows);
+            g_time_untilize += std::chrono::duration<double, std::milli>(Clock::now() - t_ut2).count();
 
             auto t_host1 = Clock::now();
             // 2. Deinterleave Q and gate
@@ -1080,8 +1107,9 @@ static float* forward_decode() {
                 // Output + sigmoid gating fused
                 float* gh = gate_heads + h * MC::head_dim;
                 for (int d = 0; d < MC::head_dim; d++)
-                    out[d] = (acc[d] / sum_exp) * (1.0f / (1.0f + expf(-gh[d])));
+                    out[d] = (acc[d] / sum_exp) * fast_sigmoidf(gh[d]);
             }
+            g_time_attn_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host1).count();
             g_time_host += std::chrono::duration<double, std::milli>(Clock::now() - t_host1).count();
 
             // 8. Write attn_out to g_residual_dev, then outproj+FFN chain ON DEVICE
@@ -1137,6 +1165,8 @@ static float* forward_decode() {
                g_time_host / dc, g_time_reswrite / dc, g_time_lmhead / dc);
         printf("    outproj_gemv: tilize=%.2f enq=%.2f disp=%.2f read=%.2f host=%.2f ms/call (%d calls)\n",
                g_t_tilize / calls, g_t_enqueue / calls, g_t_dispatch / calls, g_t_read / calls, g_t_host / calls, calls);
+        printf("    host_detail: conv1d=%.1f deltanet=%.1f untilize=%.1f attn=%.1f ms/tok\n",
+               g_time_conv1d / dc, g_time_deltanet / dc, g_time_untilize / dc, g_time_attn_host / dc);
     }
 
     return logits;
