@@ -1,10 +1,13 @@
 # Build artifacts
 build/
 tt_metal/build/
+generated/
+tt_metal/generated/
 
 # Model data
 data/
 models/
+tt_metal/models
 *.gguf
 
 # Editor
@@ -13,3 +16,6 @@ models/
 *~
 .vscode/
 .idea/
+
+# OS
+.DS_Store
