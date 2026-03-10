@@ -396,9 +396,9 @@ static void dispatch_gemv(MeshDevice* device,
         uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
         uint32_t weight_tile_bytes = tile_size(weight_format);
 
-        // BLOCK=16 empirically optimal (tested 4, 16, 64, 128)
-        uint32_t effective_block = 16;
-        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for TRID pipelining
+        // BLOCK=32: good balance of DRAM read efficiency and reader/compute pipelining
+        uint32_t effective_block = std::min(32u, Kt);
+        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for reader/compute overlap
 
         // Activation CB: Kt tiles (loaded once, reused for all output rows)
         CircularBufferConfig cb_act_cfg =
@@ -517,8 +517,9 @@ static void dispatch_gemv_resadd(MeshDevice* device,
         uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
         uint32_t weight_tile_bytes = tile_size(weight_format);
 
+        // BLOCK=16: small enough for reader/compute overlap via double-buffered CB
         uint32_t effective_block = 16;
-        uint32_t weight_cb_tiles = effective_block * 2;
+        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for reader/compute overlap
 
         // Activation CB (c_0)
         CircularBufferConfig cb_act_cfg =
@@ -638,8 +639,9 @@ static void dispatch_gemv_split(MeshDevice* device,
         uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
         uint32_t weight_tile_bytes = tile_size(weight_format);
 
+        // BLOCK=16: small enough for reader/compute overlap via double-buffered CB
         uint32_t effective_block = 16;
-        uint32_t weight_cb_tiles = effective_block * 2;
+        uint32_t weight_cb_tiles = effective_block * 2;  // double-buffered for reader/compute overlap
 
         // Activation CB (c_0)
         CircularBufferConfig cb_act_cfg =
@@ -759,8 +761,8 @@ static void dispatch_gemv_fused_norm(MeshDevice* device,
         uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
         uint32_t weight_tile_bytes = tile_size(weight_format);
 
-        uint32_t effective_block = 16;
-        uint32_t weight_cb_tiles = effective_block * 2;
+        uint32_t effective_block = Kt;
+        uint32_t weight_cb_tiles = effective_block;
 
         // Activation CB (c_0): Kt tiles for hidden + normalized activations
         CircularBufferConfig cb_act_cfg =
@@ -888,8 +890,8 @@ static void dispatch_gemv_fused_norm_split(MeshDevice* device,
         uint32_t bf16_tile_bytes = TILE_HEIGHT * TILE_WIDTH * sizeof(bfloat16);
         uint32_t weight_tile_bytes = tile_size(weight_format);
 
-        uint32_t effective_block = 16;
-        uint32_t weight_cb_tiles = effective_block * 2;
+        uint32_t effective_block = Kt;
+        uint32_t weight_cb_tiles = effective_block;
 
         // Activation CB (c_0): Kt tiles for hidden + normalized activations
         CircularBufferConfig cb_act_cfg =
