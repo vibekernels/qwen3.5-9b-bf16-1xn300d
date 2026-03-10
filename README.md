@@ -2,6 +2,8 @@
 
 Custom inference engine for Qwen3.5-9B on a single Tenstorrent N300 card (two Wormhole chips), built from scratch with tt-metalium APIs. No ttnn dependency — all matmuls, norms, and element-wise ops use custom Tensix kernels.
 
+[![Deploy to Koyeb](https://www.koyeb.com/static/images/deploy/button.svg)](https://app.koyeb.com/deploy?name=qwen3-5-9b-n300&type=docker&image=ghcr.io%2Fvibekernels%2Fqwen3.5-9b-bf16-1xn300d:latest&instance_type=gpu-tenstorrent-n300s&regions=na&instances_min=1&hc_grace_period%5B8888%5D=900&ports=8888;http;/)
+
 ## Architecture
 
 Qwen3.5-9B is a hybrid architecture with 32 layers: 8 full attention layers (every 4th) and 24 SSM delta-net recurrent layers.

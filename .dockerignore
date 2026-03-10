@@ -1,0 +1,6 @@
+.git
+build/
+*.o
+*.a
+.github/
+CLAUDE.md
