@@ -41,8 +41,8 @@ TT_DEFINES := \
 	-DTRACY_TIMER_FALLBACK
 
 CXXFLAGS := -std=gnu++20 -Wno-int-to-pointer-cast -fno-omit-frame-pointer \
-	$(TT_DEFINES) $(TT_INCLUDES) -I src -I third_party \
-	-DKERNEL_DIR=\"$(CURDIR)/kernels\"
+	$(TT_DEFINES) $(TT_INCLUDES) -I src -I src/third_party \
+	-DKERNEL_DIR=\"$(CURDIR)/src/kernels\"
 
 ENGINE_CXXFLAGS := $(CXXFLAGS) -march=native -ffast-math
 LDFLAGS := -rdynamic -Wl,-rpath,$(TT_METAL_BUILD)/lib
@@ -70,24 +70,24 @@ $(BUILD)/src/%.o: src/%.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 # Main test targets (link against engine)
-$(BUILD)/test_forward: tests/test_forward.cpp $(BUILD)/libqwen_engine.a
+$(BUILD)/test_forward: src/tests/test_forward.cpp $(BUILD)/libqwen_engine.a
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
 
-$(BUILD)/test_inference: tests/test_inference.cpp src/download.cpp $(BUILD)/libqwen_engine.a
+$(BUILD)/test_inference: src/tests/test_inference.cpp src/download.cpp $(BUILD)/libqwen_engine.a
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) tests/test_inference.cpp src/download.cpp -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
+	$(CXX) $(CXXFLAGS) src/tests/test_inference.cpp src/download.cpp -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS)
 
 # Standalone test targets (link directly against tt-metal)
-$(BUILD)/test_matmul: tests/test_matmul.cpp
+$(BUILD)/test_matmul: src/tests/test_matmul.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(TT_LIBS)
 
-$(BUILD)/test_dram_bw: tests/test_dram_bw.cpp
+$(BUILD)/test_dram_bw: src/tests/test_dram_bw.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(TT_LIBS)
 
-$(BUILD)/test_mesh_overhead: tests/test_mesh_overhead.cpp
+$(BUILD)/test_mesh_overhead: src/tests/test_mesh_overhead.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS) $(TT_LIBS)
 

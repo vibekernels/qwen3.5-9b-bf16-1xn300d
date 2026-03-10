@@ -89,14 +89,13 @@ sudo TT_METAL_RUNTIME_ROOT=/path/to/tt-metal ./build/test_forward       # full g
 ## Project structure
 
 ```
-tt_metal/
-  CMakeLists.txt              # build system
-  host/
-    engine.cpp                # inference engine (~3400 lines): forward pass, generate loop
-    engine.h                  # public API: load_model_and_tokenizer(), generate(), etc.
-    gguf_loader.cpp           # GGUF weight loading into device DRAM MeshBuffers
-    gguf_loader.h             # loader interface
-    model_config.h            # Qwen3.5-9B hyperparameters and tile dimensions
+src/
+  engine.cpp                  # inference engine: forward pass, generate loop
+  engine.h                    # public API: load_model_and_tokenizer(), generate(), etc.
+  gguf_loader.{h,cpp}        # GGUF weight loading into device DRAM MeshBuffers
+  model_config.h              # Qwen3.5-9B hyperparameters and tile dimensions
+  tokenizer.{h,cpp}          # BPE tokenizer (GPT-2 byte-level)
+  download.{h,cpp}           # HuggingFace model download
   kernels/
     compute/
       gemv.cpp                # GEMV compute kernel (matmul_tiles accumulation)
@@ -105,19 +104,18 @@ tt_metal/
       swiglu.cpp              # SwiGLU activation compute kernel
     dataflow/
       reader_gemv_dram_sharded.cpp  # DRAM-sharded GEMV reader (TRID pipelining)
-      reader_gemv_fused_norm.cpp    # Fused norm+GEMV reader (experimental, unused)
       writer_gemv.cpp               # Standard GEMV writer
       writer_gemv_split.cpp         # Split writer (gate+up → two buffers)
       writer_gemv_resadd.cpp        # GEMV writer with fused residual add
-      reader_binary_tiles_multicore.cpp  # Multi-core binary tile reader
   tests/
     test_device.cpp           # device validation
     test_matmul.cpp           # basic matmul test
     test_load_weights.cpp     # weight loading test
     test_forward.cpp          # end-to-end generation test
-src/
-  tokenizer.{h,cpp}          # BPE tokenizer (GPT-2 byte-level)
-  download.{h,cpp}           # HuggingFace model download
+    test_inference.cpp        # integration test suite
+  third_party/
+    json.hpp                  # nlohmann/json header
+Makefile                      # build system
 ```
 
 ## Key optimizations
