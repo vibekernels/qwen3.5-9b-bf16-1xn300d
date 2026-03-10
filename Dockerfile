@@ -20,6 +20,7 @@ RUN git init third_party/tt-metal && \
     git remote add origin https://github.com/tenstorrent/tt-metal.git && \
     git fetch --depth 1 origin $TT_METAL_COMMIT && \
     git checkout FETCH_HEAD && \
+    git submodule update --init --recursive && \
     git tag v0.0.0 && \
     ./build_metal.sh
 
