@@ -9,7 +9,7 @@
 # Environment:
 #   TT_METAL_HOME         — tt-metal source tree    (default: third_party/tt-metal)
 #   TT_METAL_BUILD        — tt-metal build dir      (default: $(TT_METAL_HOME)/build_Release)
-#   MODEL_PATH            — path to .gguf model     (default: auto-resolve from HuggingFace)
+#   MODEL_PATH            — path to .gguf model     (default: vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled)
 
 TT_METAL_HOME  ?= $(CURDIR)/third_party/tt-metal
 TT_METAL_BUILD ?= $(TT_METAL_HOME)/build_Release
@@ -108,7 +108,7 @@ chat: $(BUILD)/qwen-chat
 	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
 		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/qwen-chat \
-		$${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} 2>/dev/null
+		$${MODEL_PATH:-vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled} 2>/dev/null
 
 # HTTP server with chat UI
 $(BUILD)/qwen-server: src/server.cpp src/download.cpp $(BUILD)/libqwen_engine.a
@@ -119,13 +119,13 @@ serve: $(BUILD)/qwen-server
 	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
 		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/qwen-server \
-		-m $${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} \
+		-m $${MODEL_PATH:-vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled} \
 		--port $${PORT:-8888} 2>/dev/null
 
-# BFP8_B GGUF converter — CPU-only tool (no device needed)
-$(BUILD)/make_bfp8_gguf: tools/make_bfp8_gguf.cpp | $(TT_METAL_BUILD)/lib/libtt_metal.so
+# BFP8_B GGUF converter — downloads BF16, converts to BFP8_B tiled GGUF
+$(BUILD)/make_bfp8_gguf: tools/make_bfp8_gguf.cpp src/download.cpp | $(TT_METAL_BUILD)/lib/libtt_metal.so
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -march=$(MARCH) $< -o $@ $(LDFLAGS) $(TT_LIBS)
+	$(CXX) $(CXXFLAGS) -march=$(MARCH) $< src/download.cpp -o $@ $(LDFLAGS) $(TT_LIBS)
 
 # Standalone test targets (link directly against tt-metal)
 $(BUILD)/test_matmul: src/tests/test_matmul.cpp
@@ -145,13 +145,13 @@ quicktest: $(BUILD)/test_forward
 	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
 		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/test_forward \
-		$${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} \
+		$${MODEL_PATH:-vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled} \
 		"The capital of France is" 16 --raw 2>/dev/null
 
 # Run integration test suite
 test: $(BUILD)/test_inference
 	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) \
-		MODEL_PATH=$${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} \
+		MODEL_PATH=$${MODEL_PATH:-vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled} \
 		QUIET=1 \
 		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/test_inference 2>/dev/null

@@ -34,7 +34,7 @@ make clean             # remove build artifacts
 Environment variables:
 - `TT_METAL_HOME` — tt-metal source tree (default: `third_party/tt-metal`)
 - `TT_METAL_BUILD` — tt-metal build dir (default: `$(TT_METAL_HOME)/build_Release`)
-- `MODEL_PATH` — path to .gguf model file or HuggingFace tag (default: `unsloth/Qwen3.5-9B-GGUF:BF16`)
+- `MODEL_PATH` — path to .gguf model file or HuggingFace tag (default: `vibekernels/Qwen3.5-9B-GGUF:BFP8B-tiled`)
 
 ## Test suite details
 

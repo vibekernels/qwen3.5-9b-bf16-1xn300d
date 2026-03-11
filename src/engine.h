@@ -24,42 +24,32 @@ enum StopReason { STOP_EOS, STOP_LENGTH, STOP_CALLBACK };
 
 // Weights for a single full-attention layer.
 // Small norm weights: BF16 MeshBuffers on device.
-// Large matmul weights: stored as host bf16 vectors, freed after BFP8_B upload.
+// Large matmul weights: pre-packed BFP8_B tile data loaded from GGUF.
 struct AttentionLayerBuffers {
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> attn_norm;
-    std::vector<uint16_t> wqkv_host;         // [qkv_rows, n_embd] BF16 — freed after upload
-    std::vector<uint32_t> wqkv_packed;       // pre-packed BFP8_B (set when loading BFP8B GGUF)
-    std::vector<uint16_t> wo_host;           // [n_head*head_dim, n_embd] BF16 — freed after upload
-    std::vector<uint32_t> wo_packed;         // pre-packed BFP8_B
+    std::vector<uint32_t> wqkv_packed;       // pre-packed BFP8_B [qkv_rows, n_embd]
+    std::vector<uint32_t> wo_packed;         // pre-packed BFP8_B [n_head*head_dim, n_embd]
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> attn_q_norm;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> attn_k_norm;
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> post_attn_norm;
-    std::vector<uint16_t> ffn_gate_host;     // [n_ff, n_embd] BF16 — freed after upload
-    std::vector<uint32_t> ffn_gate_packed;   // pre-packed BFP8_B
-    std::vector<uint16_t> ffn_up_host;       // [n_ff, n_embd] BF16 — freed after upload
-    std::vector<uint32_t> ffn_up_packed;     // pre-packed BFP8_B
-    std::vector<uint16_t> ffn_down_host;     // [n_embd, n_ff] BF16 — freed after upload
-    std::vector<uint32_t> ffn_down_packed;   // pre-packed BFP8_B
+    std::vector<uint32_t> ffn_gate_packed;   // pre-packed BFP8_B [n_ff, n_embd]
+    std::vector<uint32_t> ffn_up_packed;     // pre-packed BFP8_B [n_ff, n_embd]
+    std::vector<uint32_t> ffn_down_packed;   // pre-packed BFP8_B [n_embd, n_ff]
 };
 
 // Weights for a single SSM (delta-net) layer.
 struct SSMLayerBuffers {
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> attn_norm;
-    std::vector<uint16_t> w_combined_host;   // [combined_rows, n_embd] BF16 — freed after upload
-    std::vector<uint32_t> w_combined_packed; // pre-packed BFP8_B (set when loading BFP8B GGUF)
+    std::vector<uint32_t> w_combined_packed; // pre-packed BFP8_B [combined_rows, n_embd]
     std::vector<float> ssm_a_host;           // [ssm_dt_rank] = [32]
     std::vector<float> ssm_conv1d_host;      // [channels * kernel] = [8192 * 4]
     std::vector<float> ssm_dt_bias_host;     // [ssm_dt_rank] = [32]
     std::vector<float> ssm_norm_host;        // [ssm_head_v_dim] = [128]
-    std::vector<uint16_t> ssm_out_host;      // [n_embd, ssm_d_inner] BF16 — freed after upload
-    std::vector<uint32_t> ssm_out_packed;    // pre-packed BFP8_B
+    std::vector<uint32_t> ssm_out_packed;    // pre-packed BFP8_B [n_embd, ssm_d_inner]
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> post_attn_norm;
-    std::vector<uint16_t> ffn_gate_host;     // [n_ff, n_embd] BF16 — freed after upload
-    std::vector<uint32_t> ffn_gate_packed;   // pre-packed BFP8_B
-    std::vector<uint16_t> ffn_up_host;       // [n_ff, n_embd] BF16 — freed after upload
-    std::vector<uint32_t> ffn_up_packed;     // pre-packed BFP8_B
-    std::vector<uint16_t> ffn_down_host;     // [n_embd, n_ff] BF16 — freed after upload
-    std::vector<uint32_t> ffn_down_packed;   // pre-packed BFP8_B
+    std::vector<uint32_t> ffn_gate_packed;   // pre-packed BFP8_B [n_ff, n_embd]
+    std::vector<uint32_t> ffn_up_packed;     // pre-packed BFP8_B [n_ff, n_embd]
+    std::vector<uint32_t> ffn_down_packed;   // pre-packed BFP8_B [n_embd, n_ff]
 };
 
 // Full model weight buffers on device DRAM.
@@ -67,8 +57,7 @@ struct SSMLayerBuffers {
 struct ModelBuffers {
     // Host-side storage for large lookup tables
     std::vector<uint16_t> tok_embd_host;  // [n_vocab * n_embd] BF16 as raw uint16
-    std::vector<uint16_t> output_host;    // [n_vocab * n_embd] BF16 as raw uint16
-    std::vector<uint32_t> output_packed;  // pre-packed BFP8_B (set when loading BFP8B GGUF)
+    std::vector<uint32_t> output_packed;  // pre-packed BFP8_B [n_vocab, n_embd]
 
     std::shared_ptr<tt::tt_metal::distributed::MeshBuffer> output_norm;
 

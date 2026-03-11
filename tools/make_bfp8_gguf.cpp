@@ -12,7 +12,11 @@
 // converted tensors. The engine's gguf_loader needs to handle this type.
 //
 // Usage:
-//   make_bfp8_gguf <input.gguf> <output.gguf>
+//   make_bfp8_gguf [input.gguf|hf-spec] <output.gguf>
+//   make_bfp8_gguf [input.gguf|hf-spec]           (output auto-named)
+//
+// Input defaults to unsloth/Qwen3.5-9B-GGUF:BF16 if omitted.
+// HuggingFace specs (org/repo:filter) are downloaded automatically.
 
 #include <cstdio>
 #include <cstdlib>
@@ -21,6 +25,8 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+
+#include "../src/download.h"
 
 #include <tt-metalium/bfloat16.hpp>
 #include <tt-metalium/constants.hpp>
@@ -179,17 +185,39 @@ static std::vector<uint32_t> pack_bf16_as_bfp8b(
 // ============================================================================
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <input.gguf> <output.gguf>\n", argv[0]);
-        fprintf(stderr, "\n");
-        fprintf(stderr, "Converts large 2D weight matrices to Tenstorrent BFP8_B\n");
-        fprintf(stderr, "tiled format (GGML type %u). All metadata and small\n", GGML_TYPE_TT_BFP8B_TILED);
-        fprintf(stderr, "tensors (norms, embeddings, SSM scalars) are copied verbatim.\n");
+    if (argc > 3) {
+        fprintf(stderr, "Usage: %s [input.gguf|hf-spec] [output.gguf]\n", argv[0]);
+        fprintf(stderr, "  input  defaults to unsloth/Qwen3.5-9B-GGUF:BF16\n");
+        fprintf(stderr, "  output defaults to <input_stem>-BFP8B-tiled.gguf\n");
         return 1;
     }
 
-    const char* in_path  = argv[1];
-    const char* out_path = argv[2];
+    // Resolve input: local path or HuggingFace spec
+    std::string in_spec = (argc >= 2) ? argv[1] : "unsloth/Qwen3.5-9B-GGUF:BF16";
+    printf("Resolving input: %s\n", in_spec.c_str());
+    std::string resolved = resolve_model(in_spec, "", [](int64_t dl, int64_t total) {
+        if (total > 0) printf("  Downloading: %.1f / %.1f GB\r",
+            dl / 1e9, total / 1e9);
+    });
+    if (resolved.empty()) {
+        fprintf(stderr, "Failed to resolve input: %s\n", in_spec.c_str());
+        return 1;
+    }
+    const char* in_path = resolved.c_str();
+    printf("\nInput: %s\n", in_path);
+
+    // Determine output path
+    std::string out_str;
+    if (argc >= 3) {
+        out_str = argv[2];
+    } else {
+        // Auto-generate: strip .gguf extension, append -BFP8B-tiled.gguf
+        out_str = resolved;
+        if (out_str.size() > 5 && out_str.substr(out_str.size() - 5) == ".gguf")
+            out_str = out_str.substr(0, out_str.size() - 5);
+        out_str += "-BFP8B-tiled.gguf";
+    }
+    const char* out_path = out_str.c_str();
 
     // =========================================================================
     // Step 1: Read input header, KV blob, tensor info

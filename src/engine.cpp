@@ -39,7 +39,6 @@
 #include <functional>
 #include <random>
 #include <immintrin.h>
-#include <sys/stat.h>
 
 // Suppress deprecation warnings from tt-metal's transitional global-scope aliases
 // (CoreCoord, CoreRange, CoreRangeSet, stl→ttsl) — we use the tt::tt_metal:: versions via using-namespace.
@@ -1958,54 +1957,7 @@ static std::shared_ptr<MeshBuffer> copy_norm_buf_to_chip1(std::shared_ptr<MeshBu
 }
 
 // ============================================================================
-// BFP8_B weight cache — skip CPU packing on subsequent runs
 // ============================================================================
-
-struct BFP8CacheHeader {
-    char magic[4];       // "BFP8"
-    uint32_t version;    // 1
-    uint64_t gguf_size;  // for invalidation
-    uint64_t gguf_mtime; // for invalidation
-    uint32_t n_entries;  // 161 = 32 layers * 5 + 1 LM head
-};
-
-static bool check_bfp8_cache(const char* model_path, const std::string& cache_path) {
-    struct stat model_st;
-    if (stat(model_path, &model_st) != 0) return false;
-
-    FILE* cf = fopen(cache_path.c_str(), "rb");
-    if (!cf) return false;
-
-    BFP8CacheHeader hdr;
-    if (fread(&hdr, sizeof(hdr), 1, cf) != 1) { fclose(cf); return false; }
-    fclose(cf);
-
-    if (memcmp(hdr.magic, "BFP8", 4) != 0 || hdr.version != 1) return false;
-    if (hdr.gguf_size != (uint64_t)model_st.st_size) return false;
-    if (hdr.gguf_mtime != (uint64_t)model_st.st_mtime) return false;
-    return true;
-}
-
-// Helper: write one packed buffer entry to cache file
-static void cache_write_entry(FILE* cf, uint32_t M, uint32_t K,
-                               const std::vector<uint32_t>& packed) {
-    uint64_t data_words = packed.size();
-    fwrite(&M, 4, 1, cf);
-    fwrite(&K, 4, 1, cf);
-    fwrite(&data_words, 8, 1, cf);
-    fwrite(packed.data(), sizeof(uint32_t), data_words, cf);
-}
-
-// Helper: read one packed buffer entry from cache file
-static std::vector<uint32_t> cache_read_entry(FILE* cf, uint32_t& M_out, uint32_t& K_out) {
-    fread(&M_out, 4, 1, cf);
-    fread(&K_out, 4, 1, cf);
-    uint64_t data_words;
-    fread(&data_words, 8, 1, cf);
-    std::vector<uint32_t> packed(data_words);
-    fread(packed.data(), sizeof(uint32_t), data_words, cf);
-    return packed;
-}
 
 // Upload packed data with TP splitting (shared by both cache-write and cache-read paths)
 static void upload_ssm_layer_packed(int ssm_idx,
@@ -2078,82 +2030,10 @@ static void upload_attn_layer_packed(int attn_idx,
     }
 }
 
-// Load all packed weights from BFP8_B cache and upload to device.
-static void create_weight_tensors_from_cache(const std::string& cache_path) {
-    printf("Loading pre-packed BFP8_B weights from cache...\n");
+// Upload pre-packed BFP8_B weights from GGUF to device DRAM.
+static void create_weight_tensors() {
+    printf("Uploading pre-packed BFP8_B weights to device...\n");
     auto t0 = std::chrono::steady_clock::now();
-
-    FILE* cf = fopen(cache_path.c_str(), "rb");
-    BFP8CacheHeader hdr;
-    fread(&hdr, sizeof(hdr), 1, cf);
-
-    int attn_idx = 0, ssm_idx = 0;
-    for (int layer = 0; layer < MC::n_layers; layer++) {
-        uint32_t M0, K0, M1, K1, M2, K2, M3, K3, M4, K4;
-        auto p0 = cache_read_entry(cf, M0, K0);
-        auto p1 = cache_read_entry(cf, M1, K1);
-        auto p2 = cache_read_entry(cf, M2, K2);
-        auto p3 = cache_read_entry(cf, M3, K3);
-        auto p4 = cache_read_entry(cf, M4, K4);
-
-        if (MC::is_recurrent(layer)) {
-            upload_ssm_layer_packed(ssm_idx, p0, M0, p1, p2, p3, p4);
-            if ((ssm_idx + 1) % 6 == 0) printf("  SSM layers 0-%d uploaded\n", ssm_idx);
-            ssm_idx++;
-        } else {
-            upload_attn_layer_packed(attn_idx, p0, M0, p1, p2, p3, p4);
-            printf("  Attn layer %d uploaded\n", attn_idx);
-            attn_idx++;
-        }
-    }
-
-    // LM head
-    uint32_t lm_M, lm_K;
-    auto p_lm = cache_read_entry(cf, lm_M, lm_K);
-    fclose(cf);
-
-    if (g_mesh1) {
-        uint32_t Mt_lm = lm_M / TILE_HEIGHT;
-        uint32_t Kt_lm = lm_K / TILE_WIDTH;
-        uint32_t Mt0_lm, Mt1_lm;
-        auto [lm_half0, lm_half1] = split_packed_m(p_lm, Mt_lm, Kt_lm, Mt0_lm, Mt1_lm);
-        g_wt.lm_head_Mt0 = Mt0_lm;
-        g_wt.lm_head_Mt1 = Mt1_lm;
-        g_wt.lm_head_buf = upload_packed_bfp8b_buf(g_mesh.get(), lm_half0, Mt0_lm * TILE_HEIGHT, MC::n_embd);
-        g_wt.lm_head_buf_1 = upload_packed_bfp8b_buf(g_mesh1.get(), lm_half1, Mt1_lm * TILE_HEIGHT, MC::n_embd);
-        g_lm_head_buf = g_wt.lm_head_buf;
-        printf("  lm_head split: chip0 %u rows, chip1 %u rows\n",
-               Mt0_lm * TILE_HEIGHT, Mt1_lm * TILE_HEIGHT);
-    } else {
-        g_wt.lm_head_buf = upload_packed_bfp8b_buf(g_mesh.get(), p_lm, lm_M, MC::n_embd);
-        g_lm_head_buf = g_wt.lm_head_buf;
-        printf("  lm_head uploaded (single chip)\n");
-    }
-
-    auto t1 = std::chrono::steady_clock::now();
-    printf("Loaded %d attn + %d SSM weights from cache (%.1fs).\n",
-           attn_idx, ssm_idx, std::chrono::duration<double>(t1 - t0).count());
-}
-
-// Create weight buffers — pack weights as BFP8_B (multi-threaded) then upload.
-// Each weight's host bf16 is freed immediately after packing to minimize peak memory.
-// If cache_path is non-empty, writes packed data to cache for next run.
-static void create_weight_tensors(const std::string& cache_path = "") {
-    printf("Packing and uploading weights as BFLOAT8_B (multi-threaded)...\n");
-    auto t0 = std::chrono::steady_clock::now();
-
-    // Open cache file for writing if path provided
-    FILE* cf = nullptr;
-    if (!cache_path.empty()) {
-        std::string tmp_path = cache_path + ".tmp";
-        cf = fopen(tmp_path.c_str(), "wb");
-        if (cf) {
-            // Write placeholder header — will be finalized at end
-            BFP8CacheHeader hdr{};
-            fwrite(&hdr, sizeof(hdr), 1, cf);
-            printf("  Writing BFP8_B cache to %s\n", cache_path.c_str());
-        }
-    }
 
     int attn_idx = 0, ssm_idx = 0;
     for (int layer = 0; layer < MC::n_layers; layer++) {
@@ -2162,40 +2042,12 @@ static void create_weight_tensors(const std::string& cache_path = "") {
             uint32_t combined_rows = MC::ssm_conv_channels + MC::ssm_d_inner
                                    + MC::ssm_dt_rank + MC::ssm_dt_rank;
 
-            // Pack all 5 SSM weights (or use pre-packed data from BFP8B GGUF)
-            std::vector<uint32_t> p_combined, p_gate, p_up, p_down, p_out;
-            if (!lw.w_combined_packed.empty()) {
-                p_combined = std::move(lw.w_combined_packed);
-                p_gate     = std::move(lw.ffn_gate_packed);
-                p_up       = std::move(lw.ffn_up_packed);
-                p_down     = std::move(lw.ffn_down_packed);
-                p_out      = std::move(lw.ssm_out_packed);
-            } else {
-                std::thread t1([&]{ p_combined = pack_bf16_as_bfp8b(lw.w_combined_host.data(), combined_rows, MC::n_embd); });
-                std::thread t2([&]{ p_gate = pack_bf16_as_bfp8b(lw.ffn_gate_host.data(), MC::n_ff, MC::n_embd); });
-                std::thread t3([&]{ p_up = pack_bf16_as_bfp8b(lw.ffn_up_host.data(), MC::n_ff, MC::n_embd); });
-                std::thread t4([&]{ p_down = pack_bf16_as_bfp8b(lw.ffn_down_host.data(), MC::n_embd, MC::n_ff); });
-                p_out = pack_bf16_as_bfp8b(lw.ssm_out_host.data(), MC::n_embd, MC::ssm_d_inner);
-                t1.join(); t2.join(); t3.join(); t4.join();
-            }
+            auto p_combined = std::move(lw.w_combined_packed);
+            auto p_gate     = std::move(lw.ffn_gate_packed);
+            auto p_up       = std::move(lw.ffn_up_packed);
+            auto p_down     = std::move(lw.ffn_down_packed);
+            auto p_out      = std::move(lw.ssm_out_packed);
 
-            // Free host bf16 data
-            { std::vector<uint16_t>().swap(lw.w_combined_host); }
-            { std::vector<uint16_t>().swap(lw.ffn_gate_host); }
-            { std::vector<uint16_t>().swap(lw.ffn_up_host); }
-            { std::vector<uint16_t>().swap(lw.ffn_down_host); }
-            { std::vector<uint16_t>().swap(lw.ssm_out_host); }
-
-            // Write to cache before upload
-            if (cf) {
-                cache_write_entry(cf, combined_rows, MC::n_embd, p_combined);
-                cache_write_entry(cf, MC::n_ff, MC::n_embd, p_gate);
-                cache_write_entry(cf, MC::n_ff, MC::n_embd, p_up);
-                cache_write_entry(cf, MC::n_embd, MC::n_ff, p_down);
-                cache_write_entry(cf, MC::n_embd, MC::ssm_d_inner, p_out);
-            }
-
-            // TP split + upload
             upload_ssm_layer_packed(ssm_idx, p_combined, combined_rows, p_gate, p_up, p_down, p_out);
 
             if ((ssm_idx + 1) % 6 == 0) printf("  SSM layers 0-%d uploaded\n", ssm_idx);
@@ -2206,40 +2058,12 @@ static void create_weight_tensors(const std::string& cache_path = "") {
             int kv_dim_one = MC::n_head_kv * MC::head_dim;
             int qkv_rows = q_dim + 2 * kv_dim_one;
 
-            // Pack all 5 attention weights (or use pre-packed data from BFP8B GGUF)
-            std::vector<uint32_t> p_qkv, p_gate, p_up, p_down, p_wo;
-            if (!lw.wqkv_packed.empty()) {
-                p_qkv  = std::move(lw.wqkv_packed);
-                p_gate = std::move(lw.ffn_gate_packed);
-                p_up   = std::move(lw.ffn_up_packed);
-                p_down = std::move(lw.ffn_down_packed);
-                p_wo   = std::move(lw.wo_packed);
-            } else {
-                std::thread t1([&]{ p_qkv = pack_bf16_as_bfp8b(lw.wqkv_host.data(), qkv_rows, MC::n_embd); });
-                std::thread t2([&]{ p_gate = pack_bf16_as_bfp8b(lw.ffn_gate_host.data(), MC::n_ff, MC::n_embd); });
-                std::thread t3([&]{ p_up = pack_bf16_as_bfp8b(lw.ffn_up_host.data(), MC::n_ff, MC::n_embd); });
-                std::thread t4([&]{ p_down = pack_bf16_as_bfp8b(lw.ffn_down_host.data(), MC::n_embd, MC::n_ff); });
-                p_wo = pack_bf16_as_bfp8b(lw.wo_host.data(), MC::n_embd, MC::n_head * MC::head_dim);
-                t1.join(); t2.join(); t3.join(); t4.join();
-            }
+            auto p_qkv  = std::move(lw.wqkv_packed);
+            auto p_gate = std::move(lw.ffn_gate_packed);
+            auto p_up   = std::move(lw.ffn_up_packed);
+            auto p_down = std::move(lw.ffn_down_packed);
+            auto p_wo   = std::move(lw.wo_packed);
 
-            // Free host bf16 data
-            { std::vector<uint16_t>().swap(lw.wqkv_host); }
-            { std::vector<uint16_t>().swap(lw.ffn_gate_host); }
-            { std::vector<uint16_t>().swap(lw.ffn_up_host); }
-            { std::vector<uint16_t>().swap(lw.ffn_down_host); }
-            { std::vector<uint16_t>().swap(lw.wo_host); }
-
-            // Write to cache before upload
-            if (cf) {
-                cache_write_entry(cf, qkv_rows, MC::n_embd, p_qkv);
-                cache_write_entry(cf, MC::n_ff, MC::n_embd, p_gate);
-                cache_write_entry(cf, MC::n_ff, MC::n_embd, p_up);
-                cache_write_entry(cf, MC::n_embd, MC::n_ff, p_down);
-                cache_write_entry(cf, MC::n_embd, MC::n_head * MC::head_dim, p_wo);
-            }
-
-            // TP split + upload
             upload_attn_layer_packed(attn_idx, p_qkv, qkv_rows, p_gate, p_up, p_down, p_wo);
 
             printf("  Attn layer %d uploaded\n", attn_idx);
@@ -2249,21 +2073,11 @@ static void create_weight_tensors(const std::string& cache_path = "") {
 
     auto t1_time = std::chrono::steady_clock::now();
     double layer_sec = std::chrono::duration<double>(t1_time - t0).count();
-    printf("Uploaded %d attention + %d SSM weight tensors as BFLOAT8_B (%.1fs).\n",
+    printf("Uploaded %d attention + %d SSM weight tensors (%.1fs).\n",
            attn_idx, ssm_idx, layer_sec);
 
     // LM head — split across 2 chips for column-parallel if available
-    std::vector<uint32_t> p_lm;
-    if (!g_model.output_packed.empty()) {
-        p_lm = std::move(g_model.output_packed);
-    } else {
-        p_lm = pack_bf16_as_bfp8b(g_model.output_host.data(), MC::n_vocab, MC::n_embd);
-        { std::vector<uint16_t>().swap(g_model.output_host); }
-    }
-
-    if (cf) {
-        cache_write_entry(cf, MC::n_vocab, MC::n_embd, p_lm);
-    }
+    auto p_lm = std::move(g_model.output_packed);
 
     if (g_mesh1) {
         uint32_t Mt_lm = MC::n_vocab / TILE_HEIGHT;
@@ -2282,40 +2096,6 @@ static void create_weight_tensors(const std::string& cache_path = "") {
         g_lm_head_buf = g_wt.lm_head_buf;
         printf("  lm_head uploaded (single chip)\n");
     }
-
-    // Finalize cache file
-    if (cf) {
-        fflush(cf);
-        fclose(cf);
-        std::string tmp_path = cache_path + ".tmp";
-        // Now rewrite header with valid data
-        cf = fopen(tmp_path.c_str(), "r+b");
-        if (cf) {
-            // Get GGUF file stats — cache_path is model_path + ".bfp8cache"
-            // model_path = cache_path minus ".bfp8cache" suffix
-            std::string model_path = cache_path.substr(0, cache_path.size() - 10);
-            struct stat st;
-            stat(model_path.c_str(), &st);
-            BFP8CacheHeader hdr;
-            memcpy(hdr.magic, "BFP8", 4);
-            hdr.version = 1;
-            hdr.gguf_size = st.st_size;
-            hdr.gguf_mtime = st.st_mtime;
-            hdr.n_entries = 32 * 5 + 1;  // 161
-            fseek(cf, 0, SEEK_SET);
-            fwrite(&hdr, sizeof(hdr), 1, cf);
-            fclose(cf);
-            rename(tmp_path.c_str(), cache_path.c_str());
-            printf("BFP8_B cache written (%.1f GB).\n",
-                   (double)st.st_size / (1024.0 * 1024.0 * 1024.0));
-            // Print actual cache size
-            struct stat cache_st;
-            if (stat(cache_path.c_str(), &cache_st) == 0) {
-                printf("  Cache file: %.1f GB\n", (double)cache_st.st_size / (1024.0 * 1024.0 * 1024.0));
-            }
-        }
-    }
-
 }
 
 // Set up norm buffers, persistent device buffers, and pre-allocate GEMV buffers.
@@ -3958,14 +3738,7 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
         return false;
     }
 
-    // Check for BFP8_B weight cache
-    std::string cache_path = std::string(model_path) + ".bfp8cache";
-    bool use_cache = check_bfp8_cache(model_path, cache_path);
-    if (use_cache) {
-        printf("Found valid BFP8_B weight cache: %s\n", cache_path.c_str());
-    }
-
-    if (!load_gguf_weights(model_path, g_model, g_mesh.get(), cq, use_cache)) {
+    if (!load_gguf_weights(model_path, g_model, g_mesh.get(), cq)) {
         fprintf(stderr, "Failed to load weights\n");
         return false;
     }
@@ -3989,16 +3762,8 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     printf("Pre-computing RoPE tables for %d positions...\n", max_ctx);
     precompute_rope(max_ctx);
 
-    // Pack and upload weight matrices to device
-    if (use_cache) {
-        printf("Loading pre-packed weights from cache...\n");
-        create_weight_tensors_from_cache(cache_path);
-    } else {
-        printf("Creating weight tensor wrappers...\n");
-        // Don't write a bfp8cache when the GGUF already has pre-packed weights
-        bool gguf_prepacked = !g_model.output_packed.empty();
-        create_weight_tensors(gguf_prepacked ? "" : cache_path);
-    }
+    // Upload pre-packed BFP8_B weights to device
+    create_weight_tensors();
 
     // Shared setup: norms, device buffers, GEMV pre-allocation
     setup_post_weight_buffers();
