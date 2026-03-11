@@ -4,10 +4,16 @@ FROM ${BASE_IMAGE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 
-# Install build dependencies (base image already has clang-20, cmake, git)
+# Install build dependencies + SSH server
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl make && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get install -y --no-install-recommends curl make openssh-server && \
+    apt-get clean && rm -rf /var/lib/apt/lists/* && \
+    mkdir -p /var/run/sshd /root/.ssh && \
+    chmod 700 /root/.ssh && \
+    ssh-keygen -A && \
+    sed -i 's/#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config && \
+    sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config && \
+    sed -i 's/#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
 
 WORKDIR /app
 
@@ -50,6 +56,6 @@ ENV TT_METAL_RUNTIME_ROOT=/app/third_party/tt-metal
 ENV QUIET=1
 ENV PORT=8888
 
-EXPOSE 8888
+EXPOSE 8888 22
 
 CMD ["/entrypoint.sh"]
