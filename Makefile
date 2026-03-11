@@ -55,9 +55,9 @@ ENGINE_SRCS := src/engine.cpp src/gguf_loader.cpp src/tokenizer.cpp
 ENGINE_OBJS := $(ENGINE_SRCS:%.cpp=$(BUILD)/%.o)
 
 # Targets
-.PHONY: all clean test quicktest setup chat
+.PHONY: all clean test quicktest setup chat serve
 
-all: $(BUILD)/test_forward $(BUILD)/test_inference $(BUILD)/qwen-chat
+all: $(BUILD)/test_forward $(BUILD)/test_inference $(BUILD)/qwen-chat $(BUILD)/qwen-server
 
 # Auto-setup: init submodule + build tt-metal if SDK not found
 $(TT_METAL_BUILD)/lib/libtt_metal.so:
@@ -98,6 +98,18 @@ chat: $(BUILD)/qwen-chat
 		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
 		$(BUILD)/qwen-chat \
 		$${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} 2>/dev/null
+
+# HTTP server with chat UI
+$(BUILD)/qwen-server: src/server.cpp src/download.cpp $(BUILD)/libqwen_engine.a
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) src/server.cpp src/download.cpp -o $@ $(LDFLAGS) $(BUILD)/libqwen_engine.a $(TT_LIBS) -lpthread
+
+serve: $(BUILD)/qwen-server
+	@env TT_METAL_RUNTIME_ROOT=$(abspath $(TT_METAL_HOME)) QUIET=1 \
+		TT_METAL_OPERATION_TIMEOUT_SECONDS=$${TT_METAL_OPERATION_TIMEOUT_SECONDS:-5} \
+		$(BUILD)/qwen-server \
+		-m $${MODEL_PATH:-unsloth/Qwen3.5-9B-GGUF:BF16} \
+		--port $${PORT:-8888} 2>/dev/null
 
 # Standalone test targets (link directly against tt-metal)
 $(BUILD)/test_matmul: src/tests/test_matmul.cpp

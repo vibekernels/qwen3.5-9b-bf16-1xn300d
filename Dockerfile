@@ -27,6 +27,7 @@ RUN git init third_party/tt-metal && \
 # Copy project source
 COPY src/ src/
 COPY third_party/json.hpp third_party/json.hpp
+COPY third_party/httplib.h third_party/httplib.h
 COPY Makefile .
 
 # Build the project (target x86-64-v4 for AVX-512 since -march=native
