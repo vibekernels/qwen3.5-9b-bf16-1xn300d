@@ -43,8 +43,8 @@ Environment variables:
 - **test_long_prompt** — ~50-token repeated prompt, verifies generation works
 - **test_prompt_exceeding_context** — prompt exceeding ctx=128, verifies graceful truncation
 - **test_emoji_in_output** — asks for emoji, validates UTF-8 output
-- **test_tok_per_sec** — 32-token decode, checks ≥5 tok/s (set `MIN_TOK_PER_SEC` to override)
-- **test_prefill_tok_per_sec** — ~50-token prefill benchmark, checks ≥5 prefill tok/s
+- **test_tok_per_sec** — 32-token decode, checks ≥7 tok/s (set `MIN_TOK_PER_SEC` to override)
+- **test_prefill_tok_per_sec** — ~50-token prefill benchmark, checks ≥70 prefill tok/s
 - **test_greedy_determinism** — two greedy runs produce identical output
 - **test_stop_on_eos** — chat prompt stops on EOS token
 
@@ -96,12 +96,12 @@ subtraction — batched prefill (~33ms/tok) is very different from single-token
 (~120ms/tok), and short prompts don't batch well (~73ms/tok for <32 tokens).
 
 Current baselines (as of 2026-03-12, 4-CPU container):
-- **Decode**: ~4.5 tok/s (215ms/tok avg, 190ms/tok best steady-state)
-- **Prefill**: ~17 tok/s (58ms/tok, batched)
+- **Decode**: ~8.2 tok/s (122ms/tok avg)
+- **Prefill**: ~87 tok/s (11.5ms/tok, batched ~50-token prompt)
 
 Note: performance depends heavily on available CPU cores. The engine uses a 4-thread
 worker pool for host-side deltanet/attention, and PCIe DMA coordination benefits from
-low CPU contention. Bare-metal 24-core achieves ~8 tok/s decode.
+low CPU contention.
 
 ## Debugging hangs
 

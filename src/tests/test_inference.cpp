@@ -288,7 +288,7 @@ static void test_tok_per_sec() {
     EXPECT_TRUE(n >= 16);  // should generate at least 16 tokens
 
     // N300 regression threshold
-    double min_tok_per_sec = 5.0;
+    double min_tok_per_sec = 7.0;
     if (const char* p = getenv("MIN_TOK_PER_SEC")) {
         min_tok_per_sec = atof(p);
     }
@@ -331,8 +331,7 @@ static void test_prefill_tok_per_sec() {
     printf("    %d prompt tokens + %d decode in %.1f ms = %.1f prefill tok/s\n",
            n_prompt, n, ms, prefill_tok_per_sec);
 
-    // N300 prefill is sequential (token-by-token), so ~15 tok/s
-    double min_prefill = 5.0;
+    double min_prefill = 70.0;
     if (const char* p = getenv("MIN_PREFILL_TOK_PER_SEC")) {
         min_prefill = atof(p);
     }

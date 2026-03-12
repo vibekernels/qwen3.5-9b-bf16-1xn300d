@@ -24,12 +24,12 @@ Qwen3.5-9B is a hybrid architecture with 32 layers: 8 full attention layers (eve
 
 | Metric | Value |
 |--------|-------|
-| Decode latency | ~65 ms/tok |
-| Decode throughput | ~15.4 tok/s |
+| Decode latency | ~122 ms/tok |
+| Decode throughput | ~8.2 tok/s |
+| Prefill throughput | ~87 tok/s |
 | Model size (device) | ~9.5 GB BFP8_B across 2 chips |
-| DRAM bandwidth utilization | ~75 GB/s per chip (~93% of achievable) |
 
-Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 12 Gbps DRAM). The first few tokens are slower while traces are captured; subsequent tokens stabilize at ~65ms.
+Performance measured on Tenstorrent N300 (2x Wormhole chips) in a 4-CPU container. The first few tokens are slower while traces are captured; subsequent tokens stabilize at ~122ms.
 
 ### Decode time breakdown (steady state)
 
@@ -52,18 +52,17 @@ Performance measured on Tenstorrent N300 (2x Wormhole chips, 1000 MHz AI clock, 
 | +Pre-alloc buffers | ~290 | ~3.4 | Zero-alloc dispatch |
 | +Dual chip TP | ~165 | ~6.1 | 2x DRAM bandwidth for FFN |
 | +Custom GEMV kernels | ~140 | ~7.1 | DRAM-sharded, TRID pipeline |
-| +Traced execution | ~90 | ~11.1 | Minimal dispatch overhead |
-| +LoFi math fidelity | ~65 | ~15.4 | Faster Tensix compute |
+| +Traced execution | ~122 | ~8.2 | Minimal dispatch overhead |
 
 ## Getting started
 
 Requires clang-20 and a Tenstorrent N300 device.
 
 ```sh
-make setup             # init tt-metal submodule + build SDK (~13 min, first time only)
-make -j$(nproc)        # build everything
-make test              # run integration tests (13 tests, ~60s)
-make quicktest         # fast smoke test: "The capital of France is" -> Paris
+./install-tt-metal-debs.sh  # install tt-metal debs (first time only)
+make -j$(nproc)             # build everything
+make test                   # run integration tests (~60s)
+make quicktest              # fast smoke test: "The capital of France is" -> Paris
 ```
 
 The model (`unsloth/Qwen3.5-9B-GGUF:BF16`) is automatically downloaded from HuggingFace on first run and cached in `~/.cache/qwen-models/`. To use a local model file instead:
@@ -88,7 +87,7 @@ PORT=9090 make serve
 make quicktest
 
 # Manual run:
-TT_METAL_RUNTIME_ROOT=$(pwd)/third_party/tt-metal \
+TT_METAL_RUNTIME_ROOT=/usr/libexec/tt-metalium \
   ./build/test_forward "unsloth/Qwen3.5-9B-GGUF:BF16" "What is the capital of France?" 128
 ```
 
