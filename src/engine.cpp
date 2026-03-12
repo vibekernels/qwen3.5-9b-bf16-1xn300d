@@ -184,6 +184,10 @@ struct TpFfnBuf {
 };
 static TpFfnBuf g_tp_ffn_0, g_tp_ffn_1;
 
+// Sequential TP: single-chip mode with two half-FFN passes on chip 0.
+// When true: g_mesh1==nullptr, half1 weights/buffers are on chip 0, no TP reduce needed.
+static bool g_seq_tp = false;
+
 // Host-side buffer for reading partial down from chip 1
 static std::vector<float> g_partial_f32(MC::n_embd);
 // Separate tiled host buffer for chip 1 reads (avoids contention with g_dev_host_tiled)
@@ -200,22 +204,24 @@ struct GemvBuf {
     std::shared_ptr<MeshBuffer> out_buf;    // device-side output buffer
     std::vector<bfloat16> out_host_tiled;   // pre-allocated host read buffer
     uint32_t M_padded;
+    bool compact = false;  // true: 64 bytes/tile (row 0 only); false: full 2KB tiles
 };
 
-// Map from (device_ptr, K, M) -> pre-allocated buffers
-static std::map<std::tuple<MeshDevice*, uint32_t, uint32_t>, GemvBuf> g_gemv_bufs;
+// Map from (device_ptr, K, M, compact) -> pre-allocated buffers
+static std::map<std::tuple<MeshDevice*, uint32_t, uint32_t, bool>, GemvBuf> g_gemv_bufs;
 
 // Device-aware DRAM bank topology lookup (forward declarations)
 static uint32_t get_num_dram_banks(MeshDevice* device);
 static const std::vector<CoreCoord>& get_dram_workers(MeshDevice* device);
 
-static GemvBuf& get_gemv_buf(MeshDevice* device, uint32_t M, uint32_t K) {
-    auto key = std::make_tuple(device, K, M);
+static GemvBuf& get_gemv_buf(MeshDevice* device, uint32_t M, uint32_t K, bool compact = false) {
+    auto key = std::make_tuple(device, K, M, compact);
     auto it = g_gemv_bufs.find(key);
     if (it != g_gemv_bufs.end()) return it->second;
 
     // Create new pre-allocated buffers
     GemvBuf buf;
+    buf.compact = compact;
     uint32_t TW = TILE_WIDTH, TH = TILE_HEIGHT;
     buf.K_padded = ((K + TW - 1) / TW) * TW;
     // Pad M to next multiple of num_dram_banks for DRAM-sharded dispatch
@@ -234,12 +240,21 @@ static GemvBuf& get_gemv_buf(MeshDevice* device, uint32_t M, uint32_t K) {
                                       dram_cfg, device);
     buf.act_host_tiled.resize(act_tiles * TH * TW, bfloat16(0.0f));
 
-    buf.out_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = out_tiles * tile_bytes},
-                                      dram_cfg, device);
-    buf.out_host_tiled.resize(out_tiles * TH * TW, bfloat16(0.0f));
+    if (compact) {
+        // Compact output: 64 bytes per tile (row 0 = face0 + face1 = 32 BF16)
+        uint32_t compact_page = 32 * sizeof(bfloat16);  // 64 bytes
+        DeviceLocalBufferConfig dram_compact{.page_size = compact_page, .buffer_type = BufferType::DRAM};
+        buf.out_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = out_tiles * compact_page},
+                                          dram_compact, device);
+        buf.out_host_tiled.resize(out_tiles * 32, bfloat16(0.0f));  // 32 BF16 per tile
+    } else {
+        buf.out_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = out_tiles * tile_bytes},
+                                          dram_cfg, device);
+        buf.out_host_tiled.resize(out_tiles * TH * TW, bfloat16(0.0f));
+    }
 
     auto [ins, _] = g_gemv_bufs.emplace(key, std::move(buf));
-    printf("  [gemv_buf] allocated K=%u M=%u on device\n", K, M); fflush(stdout);
+    printf("  [gemv_buf] allocated K=%u M=%u compact=%d on device\n", K, M, (int)compact); fflush(stdout);
     return ins->second;
 }
 
@@ -366,7 +381,7 @@ struct CachedGemvWorkload {
     MeshWorkload workload;
     bool valid = false;
 };
-static std::map<std::tuple<uintptr_t,uint32_t,uint32_t,uint32_t>, CachedGemvWorkload> g_gemv_cache;
+static std::map<std::tuple<uintptr_t,uint32_t,uint32_t,uint32_t,uint32_t>, CachedGemvWorkload> g_gemv_cache;
 
 // DRAM-sharded GEMV: y[1,M] = x[1,K] @ W[M,K]^T
 // Uses 12 DRAM-optimal cores (one per bank) for maximum bandwidth.
@@ -377,10 +392,12 @@ static void dispatch_gemv(MeshDevice* device,
                            std::shared_ptr<MeshBuffer> weight_buf,
                            std::shared_ptr<MeshBuffer> out_buf,
                            uint32_t M, uint32_t K,
-                           tt::DataFormat weight_format = tt::DataFormat::Bfp8_b) {
+                           tt::DataFormat weight_format = tt::DataFormat::Bfp8_b,
+                           bool compact_out = false) {
     auto& cq = device->mesh_command_queue();
     auto key = std::make_tuple((uintptr_t)device, (uint32_t)act_buf->address(),
-                               (uint32_t)weight_buf->address(), (uint32_t)out_buf->address());
+                               (uint32_t)weight_buf->address(), (uint32_t)out_buf->address(),
+                               compact_out ? 1u : 0u);
     auto& cached = g_gemv_cache[key];
 
     if (!cached.valid) {
@@ -445,11 +462,14 @@ static void dispatch_gemv(MeshDevice* device,
             ComputeConfig{.math_fidelity = MathFidelity::LoFi, .compile_args = compute_ct_args});
 
         // Writer kernel: writes output tiles to interleaved out_buf
+        // compact_out: writes only face0+face1 (64 bytes/tile) instead of full 2KB tile
         std::vector<uint32_t> writer_ct_args = {(uint32_t)CBIndex::c_16};
         TensorAccessorArgs(*out_buf).append_to(writer_ct_args);
 
+        const char* writer_kernel = compact_out ? "dataflow/writer_gemv_multicore_compact.cpp"
+                                                : "dataflow/writer_gemv_multicore.cpp";
         auto writer_kid = CreateKernel(program,
-            kernel_path("dataflow/writer_gemv_multicore.cpp"), all_cores,
+            kernel_path(writer_kernel), all_cores,
             DataMovementConfig{.processor = DataMovementProcessor::RISCV_0,
                                .noc = NOC::RISCV_0_default,
                                .compile_args = writer_ct_args});
@@ -1473,8 +1493,9 @@ static void norm_matmul_ops(std::shared_ptr<MeshBuffer> norm_weight_buf,
     constexpr uint32_t embd_tiles = MC::n_embd / TILE_WIDTH;
     dispatch_rmsnorm_fpu(g_mesh.get(), g_hidden_dev_buf, norm_weight_buf,
                          g_norm_dev_buf, MC::n_embd, embd_tiles);
-    auto& gb = get_gemv_buf(g_mesh.get(), M, K);
-    dispatch_gemv(g_mesh.get(), g_norm_dev_buf, weight_buf, gb.out_buf, M, K);
+    auto& gb = get_gemv_buf(g_mesh.get(), M, K, /*compact=*/true);
+    dispatch_gemv(g_mesh.get(), g_norm_dev_buf, weight_buf, gb.out_buf, M, K,
+                  tt::DataFormat::Bfp8_b, /*compact_out=*/true);
 }
 
 // Chip 1 version: rmsnorm + GEMV on chip 1's hidden/norm buffers
@@ -1572,9 +1593,23 @@ static void outproj_ffn_chain_ops_tp1(
                         n_ff_tp * 2, MC::n_embd, n_ff_tp);
     dispatch_swiglu(g_mesh1.get(), g_tp_ffn_1.gate_buf, g_tp_ffn_1.up_buf,
                     g_tp_ffn_1.act_buf, n_ff_tp_tiles);
-    // Plain GEMV (not resadd) - output partial sum to dedicated buffer
+    // Plain GEMV (not resadd) - output partial sum to dedicated compact buffer
     dispatch_gemv(g_mesh1.get(), g_tp_ffn_1.act_buf, down_weight_buf,
-                  g_partial_down_buf_1, MC::n_embd, n_ff_tp);
+                  g_partial_down_buf_1, MC::n_embd, n_ff_tp, tt::DataFormat::Bfp8_b, /*compact_out=*/true);
+}
+
+// Sequential-TP: second half FFN on chip 0 (g_norm_dev_buf already computed by half0).
+// Adds FFN_half1 partial to g_hidden_dev_buf (resadd).
+static void ffn_second_half_chip0(
+    std::shared_ptr<MeshBuffer> gate_up_weight_buf,
+    std::shared_ptr<MeshBuffer> down_weight_buf) {
+    dispatch_gemv_split(g_mesh.get(), g_norm_dev_buf, gate_up_weight_buf,
+                        g_tp_ffn_1.gate_buf, g_tp_ffn_1.up_buf,
+                        n_ff_tp * 2, MC::n_embd, n_ff_tp);
+    dispatch_swiglu(g_mesh.get(), g_tp_ffn_1.gate_buf, g_tp_ffn_1.up_buf,
+                    g_tp_ffn_1.act_buf, n_ff_tp_tiles);
+    dispatch_gemv_resadd(g_mesh.get(), g_tp_ffn_1.act_buf, down_weight_buf,
+                         g_hidden_dev_buf, MC::n_embd, n_ff_tp);
 }
 
 // Separate tiled host buffer for write_f32_to_buf (declared before use)
@@ -1732,21 +1767,42 @@ static void read_gemv_to_f32(GemvBuf& gb, float* out, uint32_t M) {
     const uint16_t* oht = reinterpret_cast<const uint16_t*>(gb.out_host_tiled.data());
     uint32_t out_tile_cols = (M + TILE_WIDTH - 1) / TILE_WIDTH;  // use actual M, not bank-padded M_padded
     uint32_t* ybits = reinterpret_cast<uint32_t*>(out);
-    for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
-        uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
-        uint32_t base = tc * TILE_WIDTH;
-        if (base + 32 <= M) {
-            // AVX-512: load 16 bf16 from face 0, zero-extend to 32-bit, shift left 16
-            __m256i f0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(oht + tile_off));
-            __m256i f2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(oht + tile_off + 256));
-            _mm512_storeu_si512(ybits + base, _mm512_slli_epi32(_mm512_cvtepu16_epi32(f0), 16));
-            _mm512_storeu_si512(ybits + base + 16, _mm512_slli_epi32(_mm512_cvtepu16_epi32(f2), 16));
-        } else {
-            // Scalar fallback for last partial tile
-            for (uint32_t i = 0; i < 16 && base + i < M; i++)
-                ybits[base + i] = static_cast<uint32_t>(oht[tile_off + i]) << 16;
-            for (uint32_t i = 0; i < 16 && base + 16 + i < M; i++)
-                ybits[base + 16 + i] = static_cast<uint32_t>(oht[tile_off + 256 + i]) << 16;
+
+    if (gb.compact) {
+        // Compact format: 32 BF16 per tile (face0 at offset 0, face1 at offset 16)
+        for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
+            uint32_t tile_off = tc * 32;
+            uint32_t base = tc * TILE_WIDTH;
+            if (base + 32 <= M) {
+                __m256i f0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(oht + tile_off));
+                __m256i f1 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(oht + tile_off + 16));
+                _mm512_storeu_si512(ybits + base,      _mm512_slli_epi32(_mm512_cvtepu16_epi32(f0), 16));
+                _mm512_storeu_si512(ybits + base + 16, _mm512_slli_epi32(_mm512_cvtepu16_epi32(f1), 16));
+            } else {
+                for (uint32_t i = 0; i < 16 && base + i < M; i++)
+                    ybits[base + i] = static_cast<uint32_t>(oht[tile_off + i]) << 16;
+                for (uint32_t i = 0; i < 16 && base + 16 + i < M; i++)
+                    ybits[base + 16 + i] = static_cast<uint32_t>(oht[tile_off + 16 + i]) << 16;
+            }
+        }
+    } else {
+        // Full tile format: TH*TW BF16 per tile (face0 at offset 0, face1 at offset 256)
+        for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
+            uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
+            uint32_t base = tc * TILE_WIDTH;
+            if (base + 32 <= M) {
+                // AVX-512: load 16 bf16 from face 0, zero-extend to 32-bit, shift left 16
+                __m256i f0 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(oht + tile_off));
+                __m256i f2 = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(oht + tile_off + 256));
+                _mm512_storeu_si512(ybits + base,      _mm512_slli_epi32(_mm512_cvtepu16_epi32(f0), 16));
+                _mm512_storeu_si512(ybits + base + 16, _mm512_slli_epi32(_mm512_cvtepu16_epi32(f2), 16));
+            } else {
+                // Scalar fallback for last partial tile
+                for (uint32_t i = 0; i < 16 && base + i < M; i++)
+                    ybits[base + i] = static_cast<uint32_t>(oht[tile_off + i]) << 16;
+                for (uint32_t i = 0; i < 16 && base + 16 + i < M; i++)
+                    ybits[base + 16 + i] = static_cast<uint32_t>(oht[tile_off + 256 + i]) << 16;
+            }
         }
     }
 }
@@ -2040,6 +2096,35 @@ static void upload_ssm_layer_packed(int ssm_idx,
         g_wt.ssm_ffn_gate_up_buf[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), s_gate_up_h0, M0_gate_up, MC::n_embd);
         g_wt.ssm_out_buf[ssm_idx]         = upload_packed_bfp8b_buf(g_mesh.get(), p_out,        MC::n_embd, MC::ssm_d_inner);
         chip1_fut.get();
+    } else if (g_seq_tp) {
+        // Sequential TP: split like dual-chip but upload both halves to chip 0
+        static std::vector<uint32_t> s_gate_h0, s_gate_h1, s_up_h0, s_up_h1;
+        static std::vector<uint32_t> s_down_h0, s_down_h1;
+        static std::vector<uint32_t> s_gate_up_h0, s_gate_up_h1;
+
+        uint32_t Mt_ff = MC::n_ff / TILE_HEIGHT, Kt_embd = MC::n_embd / TILE_WIDTH;
+        uint32_t Mt0_gate, Mt1_gate, Mt0_up, Mt1_up;
+        split_packed_m_into(p_gate, Mt_ff, Kt_embd, s_gate_h0, s_gate_h1, Mt0_gate, Mt1_gate);
+        split_packed_m_into(p_up,   Mt_ff, Kt_embd, s_up_h0,   s_up_h1,   Mt0_up,   Mt1_up);
+        uint32_t Mt_embd = MC::n_embd / TILE_HEIGHT, Kt_ff = MC::n_ff / TILE_WIDTH;
+        split_packed_k_into(p_down, Mt_embd, Kt_ff, s_down_h0, s_down_h1);
+
+        constexpr uint32_t wpt = BFLOAT8_B_TILE_HW / sizeof(uint32_t);
+        s_gate_up_h0.resize((Mt0_gate + Mt0_up) * Kt_embd * wpt);
+        memcpy(s_gate_up_h0.data(), s_gate_h0.data(), s_gate_h0.size() * sizeof(uint32_t));
+        memcpy(s_gate_up_h0.data() + s_gate_h0.size(), s_up_h0.data(), s_up_h0.size() * sizeof(uint32_t));
+        s_gate_up_h1.resize((Mt1_gate + Mt1_up) * Kt_embd * wpt);
+        memcpy(s_gate_up_h1.data(), s_gate_h1.data(), s_gate_h1.size() * sizeof(uint32_t));
+        memcpy(s_gate_up_h1.data() + s_gate_h1.size(), s_up_h1.data(), s_up_h1.size() * sizeof(uint32_t));
+
+        uint32_t M0_gate_up = (Mt0_gate + Mt0_up) * TILE_HEIGHT;
+        uint32_t M1_gate_up = (Mt1_gate + Mt1_up) * TILE_HEIGHT;
+        // Both halves on chip 0
+        g_wt.ssm_ffn_down_buf[ssm_idx]      = upload_packed_bfp8b_buf(g_mesh.get(), s_down_h0,    MC::n_embd, n_ff_tp);
+        g_wt.ssm_ffn_gate_up_buf[ssm_idx]   = upload_packed_bfp8b_buf(g_mesh.get(), s_gate_up_h0, M0_gate_up, MC::n_embd);
+        g_wt.ssm_ffn_down_buf_1[ssm_idx]    = upload_packed_bfp8b_buf(g_mesh.get(), s_down_h1,    MC::n_embd, n_ff_tp);
+        g_wt.ssm_ffn_gate_up_buf_1[ssm_idx] = upload_packed_bfp8b_buf(g_mesh.get(), s_gate_up_h1, M1_gate_up, MC::n_embd);
+        g_wt.ssm_out_buf[ssm_idx]           = upload_packed_bfp8b_buf(g_mesh.get(), p_out,        MC::n_embd, MC::ssm_d_inner);
     } else {
         std::vector<uint32_t> gate_up(p_gate);
         gate_up.insert(gate_up.end(), p_up.begin(), p_up.end());
@@ -2089,6 +2174,35 @@ static void upload_attn_layer_packed(int attn_idx,
         g_wt.attn_ffn_gate_up_buf[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), s_gate_up_h0, M0_gate_up, MC::n_embd);
         g_wt.attn_wo_buf[attn_idx]           = upload_packed_bfp8b_buf(g_mesh.get(), p_wo,         MC::n_embd, MC::n_head * MC::head_dim);
         chip1_fut.get();
+    } else if (g_seq_tp) {
+        // Sequential TP: split and upload both halves to chip 0
+        static std::vector<uint32_t> s_gate_h0, s_gate_h1, s_up_h0, s_up_h1;
+        static std::vector<uint32_t> s_down_h0, s_down_h1;
+        static std::vector<uint32_t> s_gate_up_h0, s_gate_up_h1;
+
+        uint32_t Mt_ff = MC::n_ff / TILE_HEIGHT, Kt_embd = MC::n_embd / TILE_WIDTH;
+        uint32_t Mt0_gate, Mt1_gate, Mt0_up, Mt1_up;
+        split_packed_m_into(p_gate, Mt_ff, Kt_embd, s_gate_h0, s_gate_h1, Mt0_gate, Mt1_gate);
+        split_packed_m_into(p_up,   Mt_ff, Kt_embd, s_up_h0,   s_up_h1,   Mt0_up,   Mt1_up);
+        uint32_t Mt_embd = MC::n_embd / TILE_HEIGHT, Kt_ff = MC::n_ff / TILE_WIDTH;
+        split_packed_k_into(p_down, Mt_embd, Kt_ff, s_down_h0, s_down_h1);
+
+        constexpr uint32_t wpt = BFLOAT8_B_TILE_HW / sizeof(uint32_t);
+        s_gate_up_h0.resize((Mt0_gate + Mt0_up) * Kt_embd * wpt);
+        memcpy(s_gate_up_h0.data(), s_gate_h0.data(), s_gate_h0.size() * sizeof(uint32_t));
+        memcpy(s_gate_up_h0.data() + s_gate_h0.size(), s_up_h0.data(), s_up_h0.size() * sizeof(uint32_t));
+        s_gate_up_h1.resize((Mt1_gate + Mt1_up) * Kt_embd * wpt);
+        memcpy(s_gate_up_h1.data(), s_gate_h1.data(), s_gate_h1.size() * sizeof(uint32_t));
+        memcpy(s_gate_up_h1.data() + s_gate_h1.size(), s_up_h1.data(), s_up_h1.size() * sizeof(uint32_t));
+
+        uint32_t M0_gate_up = (Mt0_gate + Mt0_up) * TILE_HEIGHT;
+        uint32_t M1_gate_up = (Mt1_gate + Mt1_up) * TILE_HEIGHT;
+        // Both halves on chip 0
+        g_wt.attn_ffn_down_buf[attn_idx]      = upload_packed_bfp8b_buf(g_mesh.get(), s_down_h0,    MC::n_embd, n_ff_tp);
+        g_wt.attn_ffn_gate_up_buf[attn_idx]   = upload_packed_bfp8b_buf(g_mesh.get(), s_gate_up_h0, M0_gate_up, MC::n_embd);
+        g_wt.attn_ffn_down_buf_1[attn_idx]    = upload_packed_bfp8b_buf(g_mesh.get(), s_down_h1,    MC::n_embd, n_ff_tp);
+        g_wt.attn_ffn_gate_up_buf_1[attn_idx] = upload_packed_bfp8b_buf(g_mesh.get(), s_gate_up_h1, M1_gate_up, MC::n_embd);
+        g_wt.attn_wo_buf[attn_idx]            = upload_packed_bfp8b_buf(g_mesh.get(), p_wo,         MC::n_embd, MC::n_head * MC::head_dim);
     } else {
         std::vector<uint32_t> gate_up(p_gate);
         gate_up.insert(gate_up.end(), p_up.begin(), p_up.end());
@@ -2246,19 +2360,37 @@ static void setup_post_weight_buffers() {
                                                    dram_cfg, g_mesh1.get());
         g_norm_dev_buf_1 = MeshBuffer::create(ReplicatedBufferConfig{.size = embd_tiles * tile_bytes},
                                                dram_cfg, g_mesh1.get());
-        g_partial_down_buf_1 = MeshBuffer::create(ReplicatedBufferConfig{.size = embd_tiles * tile_bytes},
-                                                   dram_cfg, g_mesh1.get());
+        {
+            uint32_t compact_page = 32 * sizeof(uint16_t);  // 64 bytes: row 0 face0+face1
+            DeviceLocalBufferConfig dram_compact_cfg{.page_size = compact_page,
+                                                     .buffer_type = BufferType::DRAM};
+            g_partial_down_buf_1 = MeshBuffer::create(
+                ReplicatedBufferConfig{.size = embd_tiles * compact_page},
+                dram_compact_cfg, g_mesh1.get());
+        }
         // TP FFN intermediate buffers (half-size n_ff/2)
         uint32_t ff_tp_tiles = n_ff_tp / TILE_WIDTH;
-        auto alloc_tp_ffn = [&](TpFfnBuf& buf, MeshDevice* dev) {
+        auto alloc_tp_ffn_buf = [&](TpFfnBuf& buf, MeshDevice* dev) {
             buf.gate_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = ff_tp_tiles * tile_bytes}, dram_cfg, dev);
             buf.up_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = ff_tp_tiles * tile_bytes}, dram_cfg, dev);
             buf.act_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = ff_tp_tiles * tile_bytes}, dram_cfg, dev);
             buf.initialized = true;
         };
-        alloc_tp_ffn(g_tp_ffn_0, g_mesh.get());
-        alloc_tp_ffn(g_tp_ffn_1, g_mesh1.get());
+        alloc_tp_ffn_buf(g_tp_ffn_0, g_mesh.get());
+        alloc_tp_ffn_buf(g_tp_ffn_1, g_mesh1.get());
         printf("  TP FFN buffers allocated (n_ff_tp=%u per chip)\n", n_ff_tp);
+    } else if (g_seq_tp) {
+        // Sequential TP: both half-FFN intermediate buffers on chip 0
+        uint32_t ff_tp_tiles = n_ff_tp / TILE_WIDTH;
+        auto alloc_tp_ffn_buf = [&](TpFfnBuf& buf, MeshDevice* dev) {
+            buf.gate_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = ff_tp_tiles * tile_bytes}, dram_cfg, dev);
+            buf.up_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = ff_tp_tiles * tile_bytes}, dram_cfg, dev);
+            buf.act_buf = MeshBuffer::create(ReplicatedBufferConfig{.size = ff_tp_tiles * tile_bytes}, dram_cfg, dev);
+            buf.initialized = true;
+        };
+        alloc_tp_ffn_buf(g_tp_ffn_0, g_mesh.get());
+        alloc_tp_ffn_buf(g_tp_ffn_1, g_mesh.get());
+        printf("  Sequential-TP FFN buffers allocated (n_ff_tp=%u × 2 on chip 0)\n", n_ff_tp);
     } else {
         get_gemv_buf(g_mesh.get(), MC::n_ff, MC::n_embd);        // Gate/up projections
         get_gemv_buf(g_mesh.get(), MC::n_embd, MC::n_ff);        // Down projection
@@ -2320,26 +2452,49 @@ static void read_device_to_f32(std::shared_ptr<MeshBuffer> buf, float* out, uint
 }
 
 // Read a device buffer from chip 1 to host f32 (uses separate host buffer to avoid contention)
+// compact=true: buffer uses 64 bytes/tile (row 0 face0+face1), stride=32 uint16, face1 at +16
 static void read_device_to_f32_chip1(std::shared_ptr<MeshBuffer> buf, float* out, uint32_t len,
-                                      MeshCommandQueue& cq) {
+                                      MeshCommandQueue& cq, bool compact = false) {
     uint32_t padded = ((len + TILE_WIDTH - 1) / TILE_WIDTH) * TILE_WIDTH;
-    size_t needed = padded / TILE_WIDTH * TILE_HEIGHT * TILE_WIDTH;
+    uint32_t out_tile_cols = padded / TILE_WIDTH;
+    size_t needed = compact ? (size_t)out_tile_cols * 32
+                            : (size_t)out_tile_cols * TILE_HEIGHT * TILE_WIDTH;
     if (g_dev_host_tiled_1.size() < needed)
         g_dev_host_tiled_1.resize(needed, bfloat16(0.0f));
 
     EnqueueReadMeshBuffer(cq, g_dev_host_tiled_1, buf, true);
 
+    // Debug: check first few raw values
+    static int dbg_count = 0;
+    if (compact && dbg_count < 5) {
+        const uint16_t* d = reinterpret_cast<const uint16_t*>(g_dev_host_tiled_1.data());
+        printf("  [compact_chip1_dbg @%d] raw[0..7]:", dbg_count);
+        for (int i = 0; i < 8; i++) printf(" %04x", d[i]);
+        printf("  buf_size=%zu host_size=%zu\n", buf->size(), g_dev_host_tiled_1.size() * sizeof(bfloat16));
+        dbg_count++;
+    }
+
     const uint16_t* oht = reinterpret_cast<const uint16_t*>(g_dev_host_tiled_1.data());
-    uint32_t out_tile_cols = padded / TILE_WIDTH;
     uint32_t* ybits = reinterpret_cast<uint32_t*>(out);
-    for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
-        uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
-        uint32_t base = tc * TILE_WIDTH;
-        // Untilize: face 0 (16 elements) then face 2 (16 elements)
-        for (uint32_t i = 0; i < 16 && base + i < len; i++)
-            ybits[base + i] = static_cast<uint32_t>(oht[tile_off + i]) << 16;
-        for (uint32_t i = 0; i < 16 && base + 16 + i < len; i++)
-            ybits[base + 16 + i] = static_cast<uint32_t>(oht[tile_off + 256 + i]) << 16;
+    if (compact) {
+        for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
+            uint32_t tile_off = tc * 32;  // 32 uint16 per compact tile
+            uint32_t base = tc * TILE_WIDTH;
+            for (uint32_t i = 0; i < 16 && base + i < len; i++)
+                ybits[base + i] = static_cast<uint32_t>(oht[tile_off + i]) << 16;
+            for (uint32_t i = 0; i < 16 && base + 16 + i < len; i++)
+                ybits[base + 16 + i] = static_cast<uint32_t>(oht[tile_off + 16 + i]) << 16;
+        }
+    } else {
+        for (uint32_t tc = 0; tc < out_tile_cols; tc++) {
+            uint32_t tile_off = tc * TILE_HEIGHT * TILE_WIDTH;
+            uint32_t base = tc * TILE_WIDTH;
+            // Untilize: face 0 (16 elements) then face 2 (16 elements)
+            for (uint32_t i = 0; i < 16 && base + i < len; i++)
+                ybits[base + i] = static_cast<uint32_t>(oht[tile_off + i]) << 16;
+            for (uint32_t i = 0; i < 16 && base + 16 + i < len; i++)
+                ybits[base + 16 + i] = static_cast<uint32_t>(oht[tile_off + 256 + i]) << 16;
+        }
     }
 }
 
@@ -2456,11 +2611,11 @@ static void init_prefill_bufs() {
     g_batch_norm.resize(PREFILL_BATCH * MC::n_embd);
     g_batch_proj.resize(PREFILL_BATCH * max_proj);
     g_batch_outproj.resize(PREFILL_BATCH * MC::n_embd);
-    int ffn_dim = g_mesh1 ? (int)n_ff_tp : MC::n_ff;
+    int ffn_dim = (g_mesh1 || g_seq_tp) ? (int)n_ff_tp : MC::n_ff;
     g_batch_ffn_out.resize(PREFILL_BATCH * 2 * ffn_dim);
     g_batch_ffn_act.resize(PREFILL_BATCH * ffn_dim);
     g_batch_ffn_down.resize(PREFILL_BATCH * MC::n_embd);
-    if (g_mesh1) g_batch_ffn_down1.resize(PREFILL_BATCH * MC::n_embd);
+    if (g_mesh1 || g_seq_tp) g_batch_ffn_down1.resize(PREFILL_BATCH * MC::n_embd);
     g_prefill_bufs_inited = true;
 }
 
@@ -2803,6 +2958,68 @@ static float* forward_prefill(const int* tokens, int N) {
                         hidden[(size_t)i * MC::n_embd + j] +=
                             g_batch_ffn_down[(size_t)i * MC::n_embd + j] +
                             g_batch_ffn_down1[(size_t)i * MC::n_embd + j];
+            } else if (g_seq_tp) {
+                // Sequential-TP FFN: two half-FFN passes on chip 0
+                write_batch_to_buf(g_norm_dev_buf, norm_buf, N, MC::n_embd, g_mesh.get());
+
+                // Half 0: gate+up
+                auto& gb0_gu = get_gemv_buf(g_mesh.get(), n_ff_tp * 2, MC::n_embd);
+                dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                              gb0_gu.out_buf, n_ff_tp * 2, MC::n_embd);
+                EnqueueReadMeshBuffer(cq0, gb0_gu.out_host_tiled, gb0_gu.out_buf, true);
+                read_batch_from_tiles(gb0_gu.out_host_tiled.data(), g_batch_ffn_out.data(), N, n_ff_tp * 2);
+
+                // Half 1: gate+up
+                auto& gb1_gu = get_gemv_buf(g_mesh.get(), n_ff_tp * 2, MC::n_embd);
+                dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
+                              gb1_gu.out_buf, n_ff_tp * 2, MC::n_embd);
+                static std::vector<float> seqtp_batch_gu1;
+                if (seqtp_batch_gu1.size() < (size_t)N * n_ff_tp * 2)
+                    seqtp_batch_gu1.resize((size_t)N * n_ff_tp * 2);
+                EnqueueReadMeshBuffer(cq0, gb1_gu.out_host_tiled, gb1_gu.out_buf, true);
+                read_batch_from_tiles(gb1_gu.out_host_tiled.data(), seqtp_batch_gu1.data(), N, n_ff_tp * 2);
+
+                // SwiGLU on both halves
+                static std::vector<float> seqtp_batch_act1;
+                if (seqtp_batch_act1.size() < (size_t)N * n_ff_tp)
+                    seqtp_batch_act1.resize((size_t)N * n_ff_tp);
+                for (int i = 0; i < N; i++) {
+                    float* gu0 = g_batch_ffn_out.data() + (size_t)i * n_ff_tp * 2;
+                    float* act0 = g_batch_ffn_act.data() + (size_t)i * n_ff_tp;
+                    float* gu1 = seqtp_batch_gu1.data() + (size_t)i * n_ff_tp * 2;
+                    float* act1 = seqtp_batch_act1.data() + (size_t)i * n_ff_tp;
+                    for (uint32_t j = 0; j < (uint32_t)n_ff_tp; j += 16) {
+                        __m512 vg0 = _mm512_loadu_ps(gu0 + j);
+                        __m512 vu0 = _mm512_loadu_ps(gu0 + n_ff_tp + j);
+                        _mm512_storeu_ps(act0 + j, _mm512_mul_ps(fast_silu_avx512(vg0), vu0));
+                        __m512 vg1 = _mm512_loadu_ps(gu1 + j);
+                        __m512 vu1 = _mm512_loadu_ps(gu1 + n_ff_tp + j);
+                        _mm512_storeu_ps(act1 + j, _mm512_mul_ps(fast_silu_avx512(vg1), vu1));
+                    }
+                }
+
+                // Half 0: down GEMV
+                write_batch_to_buf(g_tp_ffn_0.act_buf, g_batch_ffn_act.data(), N, n_ff_tp, g_mesh.get());
+                auto& gb0_down = get_gemv_buf(g_mesh.get(), MC::n_embd, n_ff_tp);
+                dispatch_gemv(g_mesh.get(), g_tp_ffn_0.act_buf, g_wt.ssm_ffn_down_buf[ssm_idx],
+                              gb0_down.out_buf, MC::n_embd, n_ff_tp);
+                EnqueueReadMeshBuffer(cq0, gb0_down.out_host_tiled, gb0_down.out_buf, true);
+                read_batch_from_tiles(gb0_down.out_host_tiled.data(), g_batch_ffn_down.data(), N, MC::n_embd);
+
+                // Half 1: down GEMV
+                write_batch_to_buf(g_tp_ffn_1.act_buf, seqtp_batch_act1.data(), N, n_ff_tp, g_mesh.get());
+                auto& gb1_down = get_gemv_buf(g_mesh.get(), MC::n_embd, n_ff_tp);
+                dispatch_gemv(g_mesh.get(), g_tp_ffn_1.act_buf, g_wt.ssm_ffn_down_buf_1[ssm_idx],
+                              gb1_down.out_buf, MC::n_embd, n_ff_tp);
+                EnqueueReadMeshBuffer(cq0, gb1_down.out_host_tiled, gb1_down.out_buf, true);
+                read_batch_from_tiles(gb1_down.out_host_tiled.data(), g_batch_ffn_down1.data(), N, MC::n_embd);
+
+                // Residual add: hidden += down_half0 + down_half1
+                for (int i = 0; i < N; i++)
+                    for (int j = 0; j < MC::n_embd; j++)
+                        hidden[(size_t)i * MC::n_embd + j] +=
+                            g_batch_ffn_down[(size_t)i * MC::n_embd + j] +
+                            g_batch_ffn_down1[(size_t)i * MC::n_embd + j];
             } else {
                 // Non-TP FFN: full n_ff on chip 0
                 batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
@@ -3007,6 +3224,68 @@ static float* forward_prefill(const int* tokens, int N) {
                         hidden[(size_t)i * MC::n_embd + j] +=
                             g_batch_ffn_down[(size_t)i * MC::n_embd + j] +
                             g_batch_ffn_down1[(size_t)i * MC::n_embd + j];
+            } else if (g_seq_tp) {
+                // Sequential-TP FFN: two half-FFN passes on chip 0
+                write_batch_to_buf(g_norm_dev_buf, norm_buf, N, MC::n_embd, g_mesh.get());
+
+                // Half 0: gate+up
+                auto& attn_gb0_gu = get_gemv_buf(g_mesh.get(), n_ff_tp * 2, MC::n_embd);
+                dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.attn_ffn_gate_up_buf[attn_idx],
+                              attn_gb0_gu.out_buf, n_ff_tp * 2, MC::n_embd);
+                EnqueueReadMeshBuffer(cq0, attn_gb0_gu.out_host_tiled, attn_gb0_gu.out_buf, true);
+                read_batch_from_tiles(attn_gb0_gu.out_host_tiled.data(), g_batch_ffn_out.data(), N, n_ff_tp * 2);
+
+                // Half 1: gate+up
+                auto& attn_gb1_gu = get_gemv_buf(g_mesh.get(), n_ff_tp * 2, MC::n_embd);
+                dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.attn_ffn_gate_up_buf_1[attn_idx],
+                              attn_gb1_gu.out_buf, n_ff_tp * 2, MC::n_embd);
+                static std::vector<float> seqtp_attn_gu1;
+                if (seqtp_attn_gu1.size() < (size_t)N * n_ff_tp * 2)
+                    seqtp_attn_gu1.resize((size_t)N * n_ff_tp * 2);
+                EnqueueReadMeshBuffer(cq0, attn_gb1_gu.out_host_tiled, attn_gb1_gu.out_buf, true);
+                read_batch_from_tiles(attn_gb1_gu.out_host_tiled.data(), seqtp_attn_gu1.data(), N, n_ff_tp * 2);
+
+                // SwiGLU on both halves
+                static std::vector<float> seqtp_attn_act1;
+                if (seqtp_attn_act1.size() < (size_t)N * n_ff_tp)
+                    seqtp_attn_act1.resize((size_t)N * n_ff_tp);
+                for (int i = 0; i < N; i++) {
+                    float* gu0 = g_batch_ffn_out.data() + (size_t)i * n_ff_tp * 2;
+                    float* act0 = g_batch_ffn_act.data() + (size_t)i * n_ff_tp;
+                    float* gu1 = seqtp_attn_gu1.data() + (size_t)i * n_ff_tp * 2;
+                    float* act1 = seqtp_attn_act1.data() + (size_t)i * n_ff_tp;
+                    for (uint32_t j = 0; j < (uint32_t)n_ff_tp; j += 16) {
+                        __m512 vg0 = _mm512_loadu_ps(gu0 + j);
+                        __m512 vu0 = _mm512_loadu_ps(gu0 + n_ff_tp + j);
+                        _mm512_storeu_ps(act0 + j, _mm512_mul_ps(fast_silu_avx512(vg0), vu0));
+                        __m512 vg1 = _mm512_loadu_ps(gu1 + j);
+                        __m512 vu1 = _mm512_loadu_ps(gu1 + n_ff_tp + j);
+                        _mm512_storeu_ps(act1 + j, _mm512_mul_ps(fast_silu_avx512(vg1), vu1));
+                    }
+                }
+
+                // Half 0: down GEMV
+                write_batch_to_buf(g_tp_ffn_0.act_buf, g_batch_ffn_act.data(), N, n_ff_tp, g_mesh.get());
+                auto& attn_gb0_down = get_gemv_buf(g_mesh.get(), MC::n_embd, n_ff_tp);
+                dispatch_gemv(g_mesh.get(), g_tp_ffn_0.act_buf, g_wt.attn_ffn_down_buf[attn_idx],
+                              attn_gb0_down.out_buf, MC::n_embd, n_ff_tp);
+                EnqueueReadMeshBuffer(cq0, attn_gb0_down.out_host_tiled, attn_gb0_down.out_buf, true);
+                read_batch_from_tiles(attn_gb0_down.out_host_tiled.data(), g_batch_ffn_down.data(), N, MC::n_embd);
+
+                // Half 1: down GEMV
+                write_batch_to_buf(g_tp_ffn_1.act_buf, seqtp_attn_act1.data(), N, n_ff_tp, g_mesh.get());
+                auto& attn_gb1_down = get_gemv_buf(g_mesh.get(), MC::n_embd, n_ff_tp);
+                dispatch_gemv(g_mesh.get(), g_tp_ffn_1.act_buf, g_wt.attn_ffn_down_buf_1[attn_idx],
+                              attn_gb1_down.out_buf, MC::n_embd, n_ff_tp);
+                EnqueueReadMeshBuffer(cq0, attn_gb1_down.out_host_tiled, attn_gb1_down.out_buf, true);
+                read_batch_from_tiles(attn_gb1_down.out_host_tiled.data(), g_batch_ffn_down1.data(), N, MC::n_embd);
+
+                // Residual add: hidden += down_half0 + down_half1
+                for (int i = 0; i < N; i++)
+                    for (int j = 0; j < MC::n_embd; j++)
+                        hidden[(size_t)i * MC::n_embd + j] +=
+                            g_batch_ffn_down[(size_t)i * MC::n_embd + j] +
+                            g_batch_ffn_down1[(size_t)i * MC::n_embd + j];
             } else {
                 batch_gemv(g_mesh.get(), norm_buf, N, MC::n_embd,
                            g_norm_dev_buf, g_wt.attn_ffn_gate_up_buf[attn_idx],
@@ -3045,11 +3324,13 @@ static float* forward_prefill(const int* tokens, int N) {
     if (g_mesh1) {
         uint32_t M0 = g_wt.lm_head_Mt0 * TILE_HEIGHT;
         uint32_t M1 = g_wt.lm_head_Mt1 * TILE_HEIGHT;
-        auto& gb_lm0 = get_gemv_buf(g_mesh.get(), M0, MC::n_embd);
-        auto& gb_lm1 = get_gemv_buf(g_mesh1.get(), M1, MC::n_embd);
+        auto& gb_lm0 = get_gemv_buf(g_mesh.get(), M0, MC::n_embd, /*compact=*/true);
+        auto& gb_lm1 = get_gemv_buf(g_mesh1.get(), M1, MC::n_embd, /*compact=*/true);
         write_f32_to_buf(g_norm_dev_buf_1, g_norm_out.data(), MC::n_embd, g_mesh1.get());
-        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
-        dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
+        dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd,
+                      tt::DataFormat::Bfp8_b, /*compact_out=*/true);
+        dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd,
+                      tt::DataFormat::Bfp8_b, /*compact_out=*/true);
         auto& cq1 = g_mesh1->mesh_command_queue();
         g_hang_op.store(4, std::memory_order_relaxed);
         EnqueueReadMeshBuffer(cq0, gb_lm0.out_host_tiled, gb_lm0.out_buf, true);
@@ -3057,9 +3338,9 @@ static float* forward_prefill(const int* tokens, int N) {
         read_gemv_to_f32(gb_lm0, logits, M0);
         read_gemv_to_f32(gb_lm1, logits + M0, M1);
     } else {
-        auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
+        auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd, /*compact=*/true);
         dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
-                      MC::n_vocab, MC::n_embd);
+                      MC::n_vocab, MC::n_embd, tt::DataFormat::Bfp8_b, /*compact_out=*/true);
         g_hang_op.store(4, std::memory_order_relaxed);
         EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
         read_gemv_to_f32(gb_lm, logits, MC::n_vocab);
@@ -3146,7 +3427,7 @@ static float* forward_decode() {
                 auto t_dev_done = Clock::now();
                 g_time_ffn_device += std::chrono::duration<double, std::milli>(t_dev_done - t0).count();
                 auto& cq1 = g_mesh1->mesh_command_queue();
-                read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
+                read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1, /*compact=*/true);
                 for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
                 write_f32_to_buf(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd);
                 g_time_tp_reduce += std::chrono::duration<double, std::milli>(Clock::now() - t_dev_done).count();
@@ -3157,10 +3438,9 @@ static float* forward_decode() {
             auto t_after_read = Clock::now();
             g_time_ffn_wait += std::chrono::duration<double, std::milli>(t_after_read - t0).count();
 
-            // Write hidden to chip 1
+            // Write hidden to chip 1 (non-blocking: chip1 FFN reads it later via FIFO ordering)
             if (g_mesh1) {
                 write_f32_to_chip1_bg(g_hidden_dev_buf_1, g_hidden_f32.data(), MC::n_embd);
-                Finish(g_mesh1->mesh_command_queue());
             }
 
             g_hang_layer.store(layer, std::memory_order_relaxed);
@@ -3183,7 +3463,7 @@ static float* forward_decode() {
                                 g_combined_rows, MC::n_embd);
             }
 
-            auto& gb_comb = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd);
+            auto& gb_comb = get_gemv_buf(g_mesh.get(), g_combined_rows, MC::n_embd, /*compact=*/true);
             g_hang_layer.store(layer, std::memory_order_relaxed);
             g_hang_op.store(1, std::memory_order_relaxed);  // norm_mm_read
             EnqueueReadMeshBuffer(cq0, gb_comb.out_host_tiled, gb_comb.out_buf, true);
@@ -3389,6 +3669,47 @@ static float* forward_decode() {
                                               g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
                                               g_wt.ssm_ffn_down_buf_1[ssm_idx]);
                 }
+            } else if (g_seq_tp) {
+                // Sequential TP: half0 (outproj+rmsnorm+FFN_half0), then half1 (FFN_half1 only)
+                if (g_ffn_chain_traces_valid[layer] && g_ffn_chain_traces_valid_1[layer]) {
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
+                } else if (g_all_caches_warm) {
+                    // Capture half0 trace
+                    outproj_ffn_chain_ops_tp0(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                                              g_wt.ssm_ffn_down_buf[ssm_idx]);
+                    Finish(cq0);
+                    auto tid0 = g_mesh->begin_mesh_trace(0);
+                    outproj_ffn_chain_ops_tp0(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                                              g_wt.ssm_ffn_down_buf[ssm_idx]);
+                    g_mesh->end_mesh_trace(0, tid0);
+                    g_ffn_chain_traces[layer] = tid0;
+                    g_ffn_chain_traces_valid[layer] = true;
+                    // Capture half1 trace
+                    ffn_second_half_chip0(g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
+                                          g_wt.ssm_ffn_down_buf_1[ssm_idx]);
+                    Finish(cq0);
+                    auto tid1 = g_mesh->begin_mesh_trace(0);
+                    ffn_second_half_chip0(g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
+                                          g_wt.ssm_ffn_down_buf_1[ssm_idx]);
+                    g_mesh->end_mesh_trace(0, tid1);
+                    g_ffn_chain_traces_1[layer] = tid1;
+                    g_ffn_chain_traces_valid_1[layer] = true;
+                    // Replay both
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
+                } else {
+                    outproj_ffn_chain_ops_tp0(g_wt.ssm_out_buf[ssm_idx], MC::n_embd, MC::ssm_d_inner,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.ssm_ffn_gate_up_buf[ssm_idx],
+                                              g_wt.ssm_ffn_down_buf[ssm_idx]);
+                    ffn_second_half_chip0(g_wt.ssm_ffn_gate_up_buf_1[ssm_idx],
+                                          g_wt.ssm_ffn_down_buf_1[ssm_idx]);
+                }
             } else {
                 if (g_ffn_chain_traces_valid[layer]) {
                     g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
@@ -3430,7 +3751,7 @@ static float* forward_decode() {
                 auto t_dev_done = Clock::now();
                 g_time_ffn_device += std::chrono::duration<double, std::milli>(t_dev_done - t0).count();
                 auto& cq1 = g_mesh1->mesh_command_queue();
-                read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
+                read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1, /*compact=*/true);
                 for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
                 write_f32_to_buf(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd);
                 g_time_tp_reduce += std::chrono::duration<double, std::milli>(Clock::now() - t_dev_done).count();
@@ -3446,10 +3767,9 @@ static float* forward_decode() {
             constexpr int kv_dim_one = MC::n_head_kv * MC::head_dim;
             float* qkv = g_qkv.data();
 
-            // Write hidden to chip 1 synchronously
+            // Write hidden to chip 1 (non-blocking: chip1 FFN reads it later via FIFO ordering)
             if (g_mesh1) {
                 write_f32_to_chip1_bg(g_hidden_dev_buf_1, g_hidden_f32.data(), MC::n_embd);
-                Finish(g_mesh1->mesh_command_queue());
             }
 
             g_hang_layer.store(layer, std::memory_order_relaxed);
@@ -3472,7 +3792,7 @@ static float* forward_decode() {
                                 g_qkv_rows, MC::n_embd);
             }
 
-            auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd);
+            auto& gb_qkv = get_gemv_buf(g_mesh.get(), g_qkv_rows, MC::n_embd, /*compact=*/true);
             g_hang_op.store(1, std::memory_order_relaxed);  // norm_mm_read
             EnqueueReadMeshBuffer(cq0, gb_qkv.out_host_tiled, gb_qkv.out_buf, true);
             g_time_gemv_read += std::chrono::duration<double, std::milli>(Clock::now() - t_after_read).count();
@@ -3619,6 +3939,47 @@ static float* forward_decode() {
                                               g_wt.attn_ffn_gate_up_buf_1[attn_idx],
                                               g_wt.attn_ffn_down_buf_1[attn_idx]);
                 }
+            } else if (g_seq_tp) {
+                // Sequential TP: half0 (outproj+rmsnorm+FFN_half0), then half1 (FFN_half1 only)
+                if (g_ffn_chain_traces_valid[layer] && g_ffn_chain_traces_valid_1[layer]) {
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
+                } else if (g_all_caches_warm) {
+                    // Capture half0 trace
+                    outproj_ffn_chain_ops_tp0(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.attn_ffn_gate_up_buf[attn_idx],
+                                              g_wt.attn_ffn_down_buf[attn_idx]);
+                    Finish(cq0);
+                    auto tid0 = g_mesh->begin_mesh_trace(0);
+                    outproj_ffn_chain_ops_tp0(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.attn_ffn_gate_up_buf[attn_idx],
+                                              g_wt.attn_ffn_down_buf[attn_idx]);
+                    g_mesh->end_mesh_trace(0, tid0);
+                    g_ffn_chain_traces[layer] = tid0;
+                    g_ffn_chain_traces_valid[layer] = true;
+                    // Capture half1 trace
+                    ffn_second_half_chip0(g_wt.attn_ffn_gate_up_buf_1[attn_idx],
+                                          g_wt.attn_ffn_down_buf_1[attn_idx]);
+                    Finish(cq0);
+                    auto tid1 = g_mesh->begin_mesh_trace(0);
+                    ffn_second_half_chip0(g_wt.attn_ffn_gate_up_buf_1[attn_idx],
+                                          g_wt.attn_ffn_down_buf_1[attn_idx]);
+                    g_mesh->end_mesh_trace(0, tid1);
+                    g_ffn_chain_traces_1[layer] = tid1;
+                    g_ffn_chain_traces_valid_1[layer] = true;
+                    // Replay both
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
+                    g_mesh->replay_mesh_trace(0, g_ffn_chain_traces_1[layer], false);
+                } else {
+                    outproj_ffn_chain_ops_tp0(g_wt.attn_wo_buf[attn_idx], MC::n_embd, MC::n_head * MC::head_dim,
+                                              g_wt.post_norm_buf[layer],
+                                              g_wt.attn_ffn_gate_up_buf[attn_idx],
+                                              g_wt.attn_ffn_down_buf[attn_idx]);
+                    ffn_second_half_chip0(g_wt.attn_ffn_gate_up_buf_1[attn_idx],
+                                          g_wt.attn_ffn_down_buf_1[attn_idx]);
+                }
             } else {
                 if (g_ffn_chain_traces_valid[layer]) {
                     g_mesh->replay_mesh_trace(0, g_ffn_chain_traces[layer], false);
@@ -3656,7 +4017,7 @@ static float* forward_decode() {
     if (g_mesh1) {
         read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
         auto& cq1 = g_mesh1->mesh_command_queue();
-        read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1);
+        read_device_to_f32_chip1(g_partial_down_buf_1, g_partial_f32.data(), MC::n_embd, cq1, /*compact=*/true);
         for (int i = 0; i < MC::n_embd; i++) g_hidden_f32[i] += g_partial_f32[i];
     } else {
         read_device_to_f32(g_hidden_dev_buf, g_hidden_f32.data(), MC::n_embd, cq0);
@@ -3672,8 +4033,8 @@ static float* forward_decode() {
         // 2-chip LM head: split rows across chips for 2x bandwidth
         uint32_t M0 = g_wt.lm_head_Mt0 * TILE_HEIGHT;
         uint32_t M1 = g_wt.lm_head_Mt1 * TILE_HEIGHT;
-        auto& gb_lm0 = get_gemv_buf(g_mesh.get(), M0, MC::n_embd);
-        auto& gb_lm1 = get_gemv_buf(g_mesh1.get(), M1, MC::n_embd);
+        auto& gb_lm0 = get_gemv_buf(g_mesh.get(), M0, MC::n_embd, /*compact=*/true);
+        auto& gb_lm1 = get_gemv_buf(g_mesh1.get(), M1, MC::n_embd, /*compact=*/true);
         auto& cq1 = g_mesh1->mesh_command_queue();
 
         // Write norm to chip 1 (chip 0 already has it from above)
@@ -3683,22 +4044,28 @@ static float* forward_decode() {
             g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
             g_mesh1->replay_mesh_trace(0, g_lmhead_trace_1, false);
         } else if (g_all_caches_warm) {
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
-            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd,
+                          tt::DataFormat::Bfp8_b, /*compact_out=*/true);
+            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd,
+                          tt::DataFormat::Bfp8_b, /*compact_out=*/true);
             Finish(cq0);
             Finish(cq1);
             auto tid0 = g_mesh->begin_mesh_trace(0);
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd,
+                          tt::DataFormat::Bfp8_b, /*compact_out=*/true);
             g_mesh->end_mesh_trace(0, tid0);
             auto tid1 = g_mesh1->begin_mesh_trace(0);
-            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
+            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd,
+                          tt::DataFormat::Bfp8_b, /*compact_out=*/true);
             g_mesh1->end_mesh_trace(0, tid1);
             g_lmhead_trace = tid0;
             g_lmhead_trace_1 = tid1;
             g_lmhead_trace_valid = true;
         } else {
-            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd);
-            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd);
+            dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_wt.lm_head_buf, gb_lm0.out_buf, M0, MC::n_embd,
+                          tt::DataFormat::Bfp8_b, /*compact_out=*/true);
+            dispatch_gemv(g_mesh1.get(), g_norm_dev_buf_1, g_wt.lm_head_buf_1, gb_lm1.out_buf, M1, MC::n_embd,
+                          tt::DataFormat::Bfp8_b, /*compact_out=*/true);
         }
 
         // Read from both chips serially (concurrent reads deadlock on reader_thread_pool_mutex_)
@@ -3712,22 +4079,22 @@ static float* forward_decode() {
         read_gemv_to_f32(gb_lm1, logits + M0, M1);
     } else {
         // Single-chip LM head (traced after caches warm)
-        auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd);
+        auto& gb_lm = get_gemv_buf(g_mesh.get(), MC::n_vocab, MC::n_embd, /*compact=*/true);
         if (g_lmhead_trace_valid) {
             g_mesh->replay_mesh_trace(0, g_lmhead_trace, false);
         } else if (g_all_caches_warm) {
             dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
-                          MC::n_vocab, MC::n_embd);
+                          MC::n_vocab, MC::n_embd, tt::DataFormat::Bfp8_b, /*compact_out=*/true);
             Finish(cq0);
             auto tid = g_mesh->begin_mesh_trace(0);
             dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
-                          MC::n_vocab, MC::n_embd);
+                          MC::n_vocab, MC::n_embd, tt::DataFormat::Bfp8_b, /*compact_out=*/true);
             g_mesh->end_mesh_trace(0, tid);
             g_lmhead_trace = tid;
             g_lmhead_trace_valid = true;
         } else {
             dispatch_gemv(g_mesh.get(), g_norm_dev_buf, g_lm_head_buf, gb_lm.out_buf,
-                          MC::n_vocab, MC::n_embd);
+                          MC::n_vocab, MC::n_embd, tt::DataFormat::Bfp8_b, /*compact_out=*/true);
         }
         EnqueueReadMeshBuffer(cq0, gb_lm.out_host_tiled, gb_lm.out_buf, true);
         read_gemv_to_f32(gb_lm, logits, MC::n_vocab);
@@ -3767,7 +4134,16 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
     };
 
     // Open both N300 chips as a 1×2 MeshDevice, then create submeshes
+    // Set SINGLE_CHIP=1 to force single-chip mode (full FFN on chip 0, no TP overhead).
     bool dual_chip = false;
+    bool force_single = (getenv("SINGLE_CHIP") && std::string(getenv("SINGLE_CHIP")) != "0");
+    if (force_single) {
+        printf("SINGLE_CHIP=1: using single-chip sequential-TP mode (both FFN halves on chip 0)\n");
+        g_mesh = MeshDevice::create_unit_mesh(0);
+        g_mesh1 = nullptr;
+        g_mesh2 = nullptr;
+        g_seq_tp = true;
+    } else {
     try {
         g_mesh2 = MeshDevice::create(
             MeshDeviceConfig(MeshShape(1, 2)),
@@ -3785,6 +4161,7 @@ bool load_model_and_tokenizer(const char* model_path, int max_ctx) {
         g_mesh = MeshDevice::create_unit_mesh(0);
         g_mesh1 = nullptr;
         g_mesh2 = nullptr;
+    }
     }
     elapsed("device_init");
 
